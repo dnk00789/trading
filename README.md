@@ -59,6 +59,14 @@ a nevydá signál.
    když ho plnění posune pod práh; zaloguje se jako `skipped_slippage`.
 7. **Gap za stop obchod neotevře.** Když open plnicího baru leží už za SL,
    obchod v realitě nikdy nevznikl — místo něj jde do deníku `skipped_gap`.
+   Dotyk levelu i cooldown se přitom **vrátí zpátky**, protože gap se pozná
+   až o bar později, kdy je čítač už spotřebovaný. Vrácení se neprovede,
+   pokud mezi signálem a plněním skončila session a levely se přestavěly —
+   level, kterého se to týkalo, už neexistuje.
+8. **`skipped_concurrent` má vlastní cooldown** (`last_skip_l`/`last_skip_s`),
+   oddělený od cooldownu skutečných signálů. Bez něj by při konsolidaci na
+   levelu odešla notifikace na každém baru, kde platí pattern. Počet takto
+   potlačených alertů je v tabulce ve sloupci `Potl. skipy`.
 6. **`skipped_concurrent`** se loguje ve formátu výsledkového alertu
    (`{cas};{SMER};{score};{trida};skipped_concurrent;;;;`), obchod se netrackuje.
 7. Profil přiřazuje **celý objem baru do jednoho binu podle `hlc3`** přesně

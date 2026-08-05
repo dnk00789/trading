@@ -133,18 +133,24 @@ type Sess
     int    done_bar  = 0
     int    nbars     = 0
 
+// last_l / last_s drží cooldown SKUTEČNÝCH signálů, last_skip_* je oddělený
+// cooldown pro zahozené (skipped_concurrent) - jinak by při běžícím obchodu
+// odešla notifikace na každém baru, kde platí pattern.
 type Lvl
-    int    slot      = 0       // 0 = starší session, 1 = novější
-    string sess_name = ""
-    string abbr      = ""      // "LonVAL"
-    int    ltype     = 0       // 0 = VAL, 1 = POC, 2 = VAH
-    string tname     = ""
-    float  price     = na
-    float  w         = 0.0
-    int    touch_l   = 0
-    int    touch_s   = 0
-    int    last_l    = -100000
-    int    last_s    = -100000
+    int    slot        = 0       // 0 = starší session, 1 = novější
+    string sess_name   = ""
+    string abbr        = ""      // "LonVAL"
+    int    ltype       = 0       // 0 = VAL, 1 = POC, 2 = VAH
+    string tname       = ""
+    float  price       = na
+    float  w           = 0.0
+    int    touch_l     = 0
+    int    touch_s     = 0
+    int    last_l      = -100000
+    int    last_s      = -100000
+    int    last_skip_l = -100000
+    int    last_skip_s = -100000
+    int    skip_sup    = 0
 
 type Clu
     string id      = ""
@@ -182,6 +188,10 @@ type Cand
 
 // Signál čeká jeden bar na plnění; alert už odešel na close signálního baru,
 // takže sem stačí to, co potřebuje tracker.
+// lvl_idx, prev_last a seq slouží k vrácení dotyku, když plnění nevyjde:
+// gap se pozná až o bar později, ale čítač už je spotřebovaný. seq je clu_seq
+// v okamžiku signálu - když se mezitím přestavěly levely, dotyk se nevrací,
+// protože level, kterého se to týkalo, už neexistuje.
 type Pend
     bool   has       = false
     int    dir       = 0
@@ -192,6 +202,9 @@ type Pend
     float  r         = na
     string cls       = ""
     float  score     = 0.0
+    int    lvl_idx   = -1
+    int    prev_last = -100000
+    int    seq       = 0
 
 // r, tp1r_fill i tp2r_fill jsou přepočítané z REÁLNÉ plnicí ceny, ne z close
 // signálního baru - po gapu se plán a realita můžou lišit o desetiny R.
@@ -633,16 +646,29 @@ if conf
             t1 := (pend.dir > 0 ? pend.tp1 - fill : fill - pend.tp1) / rf
             t2 := (pend.dir > 0 ? pend.tp2 - fill : fill - pend.tp2) / rf
         bool slip_bad = i_min_tp1rf > 0 and (na(t1) or t1 < i_min_tp1rf)
+        bool rejected = false
         if gap or rf <= 0
             a_fskip := f_skip_alert(pend.dir, pend.score, pend.cls, "skipped_gap", fill, pend.sig_close, t1)
+            rejected := true
         else if slip_bad
             a_fskip := f_skip_alert(pend.dir, pend.score, pend.cls, "skipped_slippage", fill, pend.sig_close, t1)
+            rejected := true
         else
             Trade t = Trade.new(true, pend.dir, fill, pend.sig_close, pend.sl, pend.tp1, pend.tp2, rf, t1, t2, false, 0, 0, 0.0, 0.0, pend.cls, pend.score)
             if pend.dir > 0
                 trL := t
             else
                 trS := t
+        // obchod nevznikl -> vrať levelu spálený dotyk i cooldown, ale jen
+        // když se mezitím nepřestavěly levely
+        if rejected and pend.seq == clu_seq and pend.lvl_idx >= 0 and pend.lvl_idx < levels.size()
+            Lvl PL = levels.get(pend.lvl_idx)
+            if pend.dir > 0
+                PL.touch_l := math.max(0, PL.touch_l - 1)
+                PL.last_l  := pend.prev_last
+            else
+                PL.touch_s := math.max(0, PL.touch_s - 1)
+                PL.last_s  := pend.prev_last
         pend := Pend.new()
 
     // ── 2) průběh běžících obchodů (9.2: při souběhu TP a SL platí SL) ───
@@ -699,9 +725,19 @@ if conf
         bool opp_active  = dr > 0 ? trS.active : trL.active
 
         if same_busy
-            // zahozený signál nesmí spálit dotyk levelu ani nahodit cooldown -
-            // jinak o setup přijdeš dvakrát
-            a_skip := f_skip_alert(dr, cd.score, cd.cls, "skipped_concurrent", na, na, na)
+            // zahozený signál nesmí spálit dotyk levelu ani nahodit cooldown
+            // skutečných signálů - jinak o setup přijdeš dvakrát. Vlastní
+            // cooldown má ale i sám alert, jinak by při konsolidaci na levelu
+            // odcházel na každém baru.
+            int lastsk = dr > 0 ? L.last_skip_l : L.last_skip_s
+            if (bar_index - lastsk) >= i_cooldown
+                a_skip := f_skip_alert(dr, cd.score, cd.cls, "skipped_concurrent", na, na, na)
+                if dr > 0
+                    L.last_skip_l := bar_index
+                else
+                    L.last_skip_s := bar_index
+            else
+                L.skip_sup := L.skip_sup + 1
         else
             if opp_active
                 // protisměrný signál uzavře běžící obchod na aktuální ceně
@@ -711,7 +747,8 @@ if conf
                 else
                     a_exitL := f_close_alert(trL, "reversed")
                     trL.active := false
-            pend := Pend.new(true, dr, cd.entry, cd.sl, cd.tp1, cd.tp2, cd.r, cd.cls, cd.score)
+            int prev_last = dr > 0 ? L.last_l : L.last_s
+            pend := Pend.new(true, dr, cd.entry, cd.sl, cd.tp1, cd.tp2, cd.r, cd.cls, cd.score, cd.li, prev_last, clu_seq)
 
             // 4.3 + 7.3.3 čítač a cooldown visí na levelu a směru, nezávisle
             // na tom, jestli běží obchod - ale až tady, kde signál skutečně
@@ -814,13 +851,13 @@ plotshape(sig_long_plot, "Signál LONG", shape.triangleup, location.belowbar, co
 plotshape(sig_short_plot, "Signál SHORT", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.small)
 
 // ── tabulka ─────────────────────────────────────────────────────────────────
-var table tb = table.new(position.top_right, 5, 13, border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
+var table tb = table.new(position.top_right, 6, 13, border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
 
 f_cell(int col, int row, string txt, color bg, color tx) =>
     table.cell(tb, col, row, txt, text_color = tx, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
 
 if i_show_tbl and barstate.islast
-    table.clear(tb, 0, 0, 4, 12)
+    table.clear(tb, 0, 0, 5, 12)
     color hdr = color.new(color.gray, 75)
     color bg  = color.new(color.black, 85)
     color tc  = color.white
@@ -840,6 +877,7 @@ if i_show_tbl and barstate.islast
     f_cell(2, 1, "POC", hdr, tc)
     f_cell(3, 1, "VAL", hdr, tc)
     f_cell(4, 1, "VA×ATR", hdr, tc)
+    f_cell(5, 1, "", hdr, tc)
 
     for s = 0 to 1
         Sess S = s == 0 ? sess0 : sess1
@@ -858,6 +896,7 @@ if i_show_tbl and barstate.islast
     f_cell(2, 4, "Cena", hdr, tc)
     f_cell(3, 4, "Zóna", hdr, tc)
     f_cell(4, 4, "Dotyky L/S", hdr, tc)
+    f_cell(5, 4, "Potl. skipy", hdr, tc)
 
     if ready
         int row = 5
@@ -865,15 +904,18 @@ if i_show_tbl and barstate.islast
             Clu c = clusters.get(ci)
             int lidx = c.val_lvl >= 0 ? c.val_lvl : c.vah_lvl
             string tch = "-"
+            string sup = "-"
             if lidx >= 0
                 Lvl L = levels.get(lidx)
                 tch := str.tostring(L.touch_l) + " / " + str.tostring(L.touch_s)
+                sup := str.tostring(L.skip_sup)
             color cc = c.score >= 2.0 ? color.orange : tc
             f_cell(0, row, c.members, bg, cc)
             f_cell(1, row, f_num(c.score, "#.##"), bg, cc)
             f_cell(2, row, f_fmt(c.price), bg, tc)
             f_cell(3, row, f_fmt(c.lo) + " – " + f_fmt(c.hi), bg, tc)
             f_cell(4, row, tch, bg, tc)
+            f_cell(5, row, sup, bg, sup == "0" or sup == "-" ? tc : color.yellow)
             row := row + 1
 
     string trs = "nic"
