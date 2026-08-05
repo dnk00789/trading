@@ -74,22 +74,50 @@ a nevydá signál.
    rozsah baru, takže akceptační kritérium 7 (±3 ticky) je citlivé na počet
    binů — při odchylce zvyš `Počet binů`.
 
+### Zdroj profilu
+
+`volume` je v Pine prostě to, co vrátí feed — u CFD a FX feedů **už to tick
+volume je**, žádný zvláštní režim se pro něj nepočítá. Rozlišení je proto
+evidenční, ne výpočetní: tick volume měří počet změn ceny, ne velikost
+obchodů, takže value area z něj může vyjít jinde a ve statistice se ty dva
+světy nesmí smíchat. Režim se loguje v obou alertech spolu se symbolem.
+
+| Režim | Kdy | Do binů |
+|---|---|---|
+| `vol` | burzovní feed (krypto, `ES1!`, `NQ1!`, `GC1!`) | `volume` |
+| `tick` | `syminfo.type` je `cfd` nebo `forex` a `volume` je nenulové | `volume` (= tick volume) |
+| `tpo` | `volume` chybí nebo je nulové ve víc než polovině barů session | `1` za bar |
+| `tick_proxy` | volitelný; feed objem nedá vůbec | počet barů nižšího TF v baru |
+
+`tick_proxy` je v defaultu vypnutý a má **výrazně kratší historii** —
+`request.security_lower_tf()` má strop na počtu načtených LTF barů. Pro živé
+obchodování to nevadí, pro ruční procházení historie ano. Cena do binu se
+i v tomhle režimu bere z `hlc3` baru grafu.
+
+`auto` (default) rozlišuje `vol` / `tick` / `tpo`, nikdy nesáhne po
+`tick_proxy`. Když je vybraný `tick_proxy`, ale zvolený LTF není nižší než
+timeframe grafu, indikátor spadne zpátky na autodetekci a napíše to do panelu.
+
+**Doporučené symboly:** S&P 500 přes CFD brokera `US500` / `SPX500` (`tick`),
+futures `ES1!` (`vol`), index `SPX` **nepoužívat** — nemá objem. Nasdaq stejně:
+`US100` / `NAS100`, `NQ1!`, a `NDX` nepoužívat.
+
 ### Formát alertů
 
 Vstup (sekce 9):
 
 ```
-{ticker};{tf};{cas_utc};{SMER};{trida};{session};{level};{cluster_members};{cluster_score};{poradi_dotyku};{vstup_close};{vstup_next_open};{SL};{TP1};{TP2};{tp1_posunuty};{tp1_confidence};{R_body};{R_atr};{tp1_v_R};{sirka_VA_atr};{pattern}
+{ticker};{tf};{cas_utc};{SMER};{trida};{session};{level};{cluster_members};{cluster_score};{poradi_dotyku};{vstup_close};{vstup_next_open};{SL};{TP1};{TP2};{tp1_posunuty};{tp1_confidence};{R_body};{R_atr};{tp1_v_R};{sirka_VA_atr};{pattern};{profil_rezim};{symbol}
 ```
 
 `{vstup_next_open}` je ve vstupním alertu prázdné — na close signálního baru
 ještě neexistuje.
 
-Uzavření (sekce 9.3), poslední čtyři pole jsou nad rámec zadání — nesou
-slippage z bodu 1 a realizované R z bodu 4:
+Uzavření (sekce 9.3), pole za `dosel_na_TP2` jsou nad rámec zadání — nesou
+slippage, realizované R a zdroj dat:
 
 ```
-{cas};{SMER};{cluster_score};{trida};{vysledek};{MFE_v_R};{MAE_v_R};{bary_do_TP1};{dosel_na_TP2};{vstup_next_open};{slippage_body};{realized_R};{tp1_v_R_fill}
+{cas};{SMER};{cluster_score};{trida};{vysledek};{MFE_v_R};{MAE_v_R};{bary_do_TP1};{dosel_na_TP2};{vstup_next_open};{slippage_body};{realized_R};{tp1_v_R_fill};{profil_rezim};{symbol}
 ```
 
 `vysledek` ∈ `SL` / `TP1_BE` / `TP2` / `TP1_open` / `timeout` / `reversed` /

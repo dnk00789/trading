@@ -36,13 +36,14 @@
 //   8 cluster_members · 9 cluster_score · 10 poradi_dotyku · 11 vstup_close
 //   12 vstup_next_open (vždy prázdné) · 13 SL · 14 TP1 · 15 TP2
 //   16 tp1_posunuty · 17 tp1_confidence · 18 R_body · 19 R_atr · 20 tp1_v_R
-//   21 sirka_VA_atr · 22 pattern
+//   21 sirka_VA_atr · 22 pattern · 23 profil_rezim · 24 symbol
 //
-//  UZAVÍRACÍ ALERT (13 polí) - stejný formát mají i všechny skipped_* řádky,
+//  UZAVÍRACÍ ALERT (15 polí) - stejný formát mají i všechny skipped_* řádky,
 //  s prázdnými poli tam, kde hodnota neexistuje:
 //   1 cas · 2 SMER · 3 cluster_score · 4 trida · 5 vysledek · 6 MFE_v_R
 //   7 MAE_v_R · 8 bary_do_TP1 · 9 dosel_na_TP2 · 10 vstup_next_open
-//   11 slippage_body · 12 realized_R · 13 tp1_v_R_fill
+//   11 slippage_body · 12 realized_R · 13 tp1_v_R_fill · 14 profil_rezim
+//   15 symbol
 //
 //  vysledek: SL · TP1_BE · TP2 · TP1_open · timeout · reversed ·
 //            skipped_concurrent · skipped_gap · skipped_slippage
@@ -50,9 +51,43 @@
 //  realized_R respektuje dělenou pozici (i_tp1_pct): obchod, který vybral
 //  TP1 a pak se vrátil na break-even, je TP1_BE s kladným realized_R, ne
 //  nula. Bez toho deník podhodnocuje výkon v nejčastějším scénáři.
+//
+// ----------------------------------------------------------------------------
+//  ZDROJ PROFILU (profil_rezim) - eviduje se v obou alertech, protože stejná
+//  logika běží na burzovním i na CFD feedu a v jedné tabulce se ta dvě čísla
+//  nesmí smíchat. Do binů jde u vol i tick TÁŽ proměnná, rozlišení je čistě
+//  evidenční: tick volume měří počet změn ceny, ne velikost obchodů, takže
+//  value area z něj může vyjít jinde.
+//
+//   vol        burzovní feed (krypto, ES1!, NQ1!, GC1!)      -> volume
+//   tick       CFD / FX feed, volume nenulové                -> volume
+//              (rozpozná se podle syminfo.type cfd / forex)     (= tick volume)
+//   tpo        volume je na nebo nulové ve víc než polovině  -> 1 za bar
+//              barů session
+//   tick_proxy feed objem nedá vůbec; příspěvkem baru je     -> počet LTF barů
+//              počet barů nižšího timeframu, které do něj
+//              spadnou. VOLITELNÝ, v defaultu vypnutý.
+//
+//  POZOR na tick_proxy: request.security_lower_tf() má strop na počtu
+//  načtených LTF barů, takže historie bude výrazně kratší než u ostatních
+//  režimů. Pro živé obchodování to nevadí, pro ruční procházení historie ano.
+//  Cena do binu se i v tomhle režimu bere z hlc3 baru grafu, ne z LTF dat.
+//
+// ----------------------------------------------------------------------------
+//  DOPORUČENÉ SYMBOLY
+//
+//   S&P 500 (CFD broker)     US500 / SPX500 dle feedu   profil: tick
+//   S&P 500 (futures)        ES1!                       profil: vol
+//   S&P 500 (index)          SPX                        NEPOUŽÍVAT, nemá objem
+//   Nasdaq (CFD broker)      US100 / NAS100 dle feedu   profil: tick
+//   Nasdaq (futures)         NQ1!                       profil: vol
+//   Nasdaq (index)           NDX                        NEPOUŽÍVAT, nemá objem
+//
+//  Sloupec "Preset" ze zadání tu není - presety parametrů podle třídy
+//  instrumentu v tomhle buildu neexistují, přišly by až s v3.2.
 // ============================================================================
 
-indicator("Session Value Area — Rejection & Reversion v3.1", "SVA-RR", overlay = true, max_boxes_count = 100, max_labels_count = 500, max_lines_count = 100, max_bars_back = 500)
+indicator("Session Value Area — Rejection & Reversion v3.2a", "SVA-RR", overlay = true, max_boxes_count = 100, max_labels_count = 500, max_lines_count = 100, max_bars_back = 500)
 
 // ────────────────────────────────────────────────────────────────────────────
 //  INPUTS
@@ -64,6 +99,8 @@ i_lon   = input.string("03:00",            "Start London (HH:MM)",   group = G_S
 i_ny    = input.string("09:30",            "Start New York (HH:MM)", group = G_SESS)
 
 var string G_PROF = "2 · Profil / Value area"
+i_prof_src = input.string("auto", "Zdroj profilu", options = ["auto", "vol", "tick", "tpo", "tick_proxy"], group = G_PROF)
+i_ltf      = input.timeframe("1", "Tick-proxy: nižší timeframe", group = G_PROF)
 i_bins    = input.int(50,    "Počet binů",   minval = 5,  maxval = 500, group = G_PROF)
 i_va_pct  = input.float(70,  "Value area %", minval = 30, maxval = 95,  group = G_PROF)
 i_atr_len = input.int(14,    "ATR délka",    minval = 2,                group = G_PROF)
@@ -132,6 +169,7 @@ type Sess
     float  atr_done  = na
     int    done_bar  = 0
     int    nbars     = 0
+    string mode      = "vol"
 
 // last_l / last_s drží cooldown SKUTEČNÝCH signálů, last_skip_* je oddělený
 // cooldown pro zahozené (skipped_concurrent) - jinak by při běžícím obchodu
@@ -185,6 +223,7 @@ type Cand
     string sessname = ""
     float  va_atr   = na
     int    order    = 0
+    string mode     = "vol"
 
 // Signál čeká jeden bar na plnění; alert už odešel na close signálního baru,
 // takže sem stačí to, co potřebuje tracker.
@@ -205,6 +244,7 @@ type Pend
     int    lvl_idx   = -1
     int    prev_last = -100000
     int    seq       = 0
+    string mode      = "vol"
 
 // r, tp1r_fill i tp2r_fill jsou přepočítané z REÁLNÉ plnicí ceny, ne z close
 // signálního baru - po gapu se plán a realita můžou lišit o desetiny R.
@@ -226,6 +266,7 @@ type Trade
     float  mae       = 0.0
     string cls       = ""
     float  score     = 0.0
+    string mode      = "vol"
 
 // ────────────────────────────────────────────────────────────────────────────
 //  POMOCNÉ FUNKCE
@@ -268,10 +309,11 @@ f_num(float x, string f) => str.tostring(x, f)
 
 // Volume profil dokončené session + kontrola validity (3.1).
 // Vrací hotový Sess, nebo na, pokud session z registru vypadává.
-f_make_sess(array<float> px, array<float> vl, int sid, float a_now) =>
+f_make_sess(array<float> px, array<float> vl, int sid, float a_now, string mode) =>
     Sess r = na
     int   n   = px.size()
-    float tot = n > 0 ? vl.sum() : 0.0
+    bool  tpo = mode == "tpo"
+    float tot = n > 0 ? (tpo ? n : vl.sum()) : 0.0
     float lo  = n > 0 ? px.min() : na
     float hi  = n > 0 ? px.max() : na
     bool basics = n >= i_min_bars and tot > 0 and not na(lo) and not na(hi) and hi > lo
@@ -281,7 +323,7 @@ f_make_sess(array<float> px, array<float> vl, int sid, float a_now) =>
         for i = 0 to n - 1
             int idx = int(math.floor((px.get(i) - lo) / w))
             idx := math.max(0, math.min(i_bins - 1, idx))
-            bins.set(idx, bins.get(idx) + vl.get(i))
+            bins.set(idx, bins.get(idx) + (tpo ? 1.0 : vl.get(i)))
         int   pi = 0
         float pv = -1.0
         for i = 0 to i_bins - 1
@@ -311,7 +353,7 @@ f_make_sess(array<float> px, array<float> vl, int sid, float a_now) =>
         float wdt = vah - val
         // mrtvá session / trendová session -> celá se vyřadí
         if wdt >= i_min_va * a_now and wdt <= i_max_va * a_now
-            r := Sess.new(f_sname(sid), f_sabbr(sid), sid, vah, (pl + ph) / 2.0, pl, ph, val, a_now, bar_index, n)
+            r := Sess.new(f_sname(sid), f_sabbr(sid), sid, vah, (pl + ph) / 2.0, pl, ph, val, a_now, bar_index, n, mode)
     r
 
 // 6 levelů ze dvou aktivních sessions (4.1)
@@ -385,6 +427,7 @@ var array<float> acc_px  = array.new<float>()
 var array<float> acc_vol = array.new<float>()
 var int   cur_sid  = -1
 var int   cur_bars = 0
+var int   cur_zero = 0
 
 var Sess sess0 = na                        // starší z dvojice
 var Sess sess1 = na                        // novější z dvojice
@@ -402,6 +445,17 @@ int s_tok = f_hm(i_tok)
 int s_lon = f_hm(i_lon)
 int s_ny  = f_hm(i_ny)
 
+// Zdroj profilu. U vol i tick jde do binů táž proměnná - rozlišení je čistě
+// evidenční, ale ve statistice musíš vědět, ze kterého světa obchod pochází.
+bool  feed_tick = syminfo.type == "cfd" or syminfo.type == "forex"
+bool  ltf_ok    = timeframe.in_seconds(i_ltf) < timeframe.in_seconds(timeframe.period)
+bool  proxy_on  = i_prof_src == "tick_proxy" and ltf_ok
+int   ltf_n = 0
+if proxy_on
+    // v6 dynamic requests: request.* smí být v lokálním scope
+    array<float> lt = request.security_lower_tf(syminfo.tickerid, i_ltf, close)
+    ltf_n := na(lt) ? 0 : lt.size()
+
 bool  tf_ok   = timeframe.in_seconds() <= 900
 bool  in_win  = not na(time(timeframe.period, i_window, i_tz))
 float atr_pct = close > 0 and not na(atr) ? atr / close * 100.0 : na
@@ -417,7 +471,15 @@ if conf
     if sid != cur_sid
         // ── dokončení předchozí session ──────────────────────────────────
         if cur_sid >= 0 and cur_bars > 0
-            Sess s = f_make_sess(acc_px, acc_vol, cur_sid, atr)
+            // tpo se pozná až tady - podíl barů bez objemu je znám až na konci
+            string md = "vol"
+            if proxy_on
+                md := "tick_proxy"
+            else if i_prof_src == "vol" or i_prof_src == "tick" or i_prof_src == "tpo"
+                md := i_prof_src
+            else
+                md := cur_zero * 2 > cur_bars ? "tpo" : (feed_tick ? "tick" : "vol")
+            Sess s = f_make_sess(acc_px, acc_vol, cur_sid, atr, md)
             if not na(s)
                 sess0 := sess1
                 sess1 := s
@@ -441,13 +503,20 @@ if conf
         acc_px.clear()
         acc_vol.clear()
         cur_bars := 0
+        cur_zero := 0
         cur_sid  := sid
 
     // ── akumulace profilu běžící session (jinak se běžící session nepoužívá)
-    float v = na(volume) ? 0.0 : volume
+    bool no_vol = na(volume) or volume <= 0
+    float v = no_vol ? 0.0 : volume
+    if proxy_on
+        // příspěvkem baru je počet barů nižšího TF, které do něj spadly
+        v := ltf_n > 0 ? ltf_n : 1.0
     acc_px.push(hlc3)
     acc_vol.push(v)
     cur_bars := cur_bars + 1
+    if no_vol
+        cur_zero := cur_zero + 1
 
 // Studený start (2.1)
 bool ready = not na(sess0) and not na(sess1) and clusters.size() > 0
@@ -555,7 +624,7 @@ f_eval(int dir) =>
 
                         if cd_ok and touch_ok and r_ok and dist_ok and ratio_ok
                             float aref = S.atr_done > 0 ? S.atr_done : atr
-                            Cand cnd = Cand.new(true, ci, li, entry, sl, tp1, tp2, R, tp1r, shifted, cfd, cls, pA ? "A" : "B", c.score, c.members, L.tname, S.name, (S.vah - S.val) / aref, ordn)
+                            Cand cnd = Cand.new(true, ci, li, entry, sl, tp1, tp2, R, tp1r, shifted, cfd, cls, pA ? "A" : "B", c.score, c.members, L.tname, S.name, (S.vah - S.val) / aref, ordn, S.mode)
                             best := cnd
     best
 
@@ -602,11 +671,13 @@ f_close_alert(Trade t, string res) =>
     s := s + ";" + f_num(slip, "#.####")
     s := s + ";" + f_num(realized, "#.###")
     s := s + ";" + f_num(t.tp1r_fill, "#.##")
+    s := s + ";" + t.mode
+    s := s + ";" + syminfo.ticker
     s
 
 // Zahozený signál ve stejném formátu jako uzavírací alert - prázdná pole tam,
 // kde hodnota neexistuje. Sloupce v deníku tím zůstanou zarovnané.
-f_skip_alert(int dir, float score, string cls, string res, float fill, float sigc, float tp1rf) =>
+f_skip_alert(int dir, float score, string cls, string res, float fill, float sigc, float tp1rf, string mode) =>
     float slip = na
     if not na(fill) and not na(sigc)
         slip := dir > 0 ? fill - sigc : sigc - fill
@@ -623,6 +694,8 @@ f_skip_alert(int dir, float score, string cls, string res, float fill, float sig
     s := s + ";" + (na(slip) ? "" : f_num(slip, "#.####"))
     s := s + ";"
     s := s + ";" + (na(tp1rf) ? "" : f_num(tp1rf, "#.##"))
+    s := s + ";" + mode
+    s := s + ";" + syminfo.ticker
     s
 
 bool   sig_long_plot  = false
@@ -648,13 +721,13 @@ if conf
         bool slip_bad = i_min_tp1rf > 0 and (na(t1) or t1 < i_min_tp1rf)
         bool rejected = false
         if gap or rf <= 0
-            a_fskip := f_skip_alert(pend.dir, pend.score, pend.cls, "skipped_gap", fill, pend.sig_close, t1)
+            a_fskip := f_skip_alert(pend.dir, pend.score, pend.cls, "skipped_gap", fill, pend.sig_close, t1, pend.mode)
             rejected := true
         else if slip_bad
-            a_fskip := f_skip_alert(pend.dir, pend.score, pend.cls, "skipped_slippage", fill, pend.sig_close, t1)
+            a_fskip := f_skip_alert(pend.dir, pend.score, pend.cls, "skipped_slippage", fill, pend.sig_close, t1, pend.mode)
             rejected := true
         else
-            Trade t = Trade.new(true, pend.dir, fill, pend.sig_close, pend.sl, pend.tp1, pend.tp2, rf, t1, t2, false, 0, 0, 0.0, 0.0, pend.cls, pend.score)
+            Trade t = Trade.new(true, pend.dir, fill, pend.sig_close, pend.sl, pend.tp1, pend.tp2, rf, t1, t2, false, 0, 0, 0.0, 0.0, pend.cls, pend.score, pend.mode)
             if pend.dir > 0
                 trL := t
             else
@@ -731,7 +804,7 @@ if conf
             // odcházel na každém baru.
             int lastsk = dr > 0 ? L.last_skip_l : L.last_skip_s
             if (bar_index - lastsk) >= i_cooldown
-                a_skip := f_skip_alert(dr, cd.score, cd.cls, "skipped_concurrent", na, na, na)
+                a_skip := f_skip_alert(dr, cd.score, cd.cls, "skipped_concurrent", na, na, na, cd.mode)
                 if dr > 0
                     L.last_skip_l := bar_index
                 else
@@ -748,7 +821,7 @@ if conf
                     a_exitL := f_close_alert(trL, "reversed")
                     trL.active := false
             int prev_last = dr > 0 ? L.last_l : L.last_s
-            pend := Pend.new(true, dr, cd.entry, cd.sl, cd.tp1, cd.tp2, cd.r, cd.cls, cd.score, cd.li, prev_last, clu_seq)
+            pend := Pend.new(true, dr, cd.entry, cd.sl, cd.tp1, cd.tp2, cd.r, cd.cls, cd.score, cd.li, prev_last, clu_seq, cd.mode)
 
             // 4.3 + 7.3.3 čítač a cooldown visí na levelu a směru, nezávisle
             // na tom, jestli běží obchod - ale až tady, kde signál skutečně
@@ -788,6 +861,8 @@ if conf
             e := e + ";" + f_num(cd.tp1r, "#.##")
             e := e + ";" + f_num(cd.va_atr, "#.##")
             e := e + ";" + cd.pattern
+            e := e + ";" + cd.mode
+            e := e + ";" + syminfo.ticker
             a_entry := e
 
             if dr > 0
@@ -867,10 +942,23 @@ if i_show_tbl and barstate.islast
         warn := "⚠ TF > 15m — indikátor je pro 1m–15m"
     else if not ready
         warn := "⏳ čekám na data"
+    if i_prof_src == "tick_proxy" and not ltf_ok
+        warn := warn + (warn == "" ? "" : " · ") + "⚠ LTF není nižší než TF grafu, jedu na autodetekci"
+    else if proxy_on
+        warn := warn + (warn == "" ? "" : " · ") + "⚠ tick_proxy: krátká historie"
 
-    f_cell(0, 0, "SVA-RR v3.1", hdr, tc)
+    // režim profilu novější dokončené session; dokud žádná není, jen záměr
+    string md_now = i_prof_src
+    if not na(sess1)
+        md_now := sess1.mode
+    else if i_prof_src == "auto"
+        md_now := feed_tick ? "tick?" : "vol?"
+
+    f_cell(0, 0, "SVA-RR v3.2a", hdr, tc)
     f_cell(1, 0, "ATR " + f_fmt(atr), hdr, tc)
-    f_cell(2, 0, warn, hdr, warn == "" ? tc : color.yellow)
+    f_cell(2, 0, "profil: " + md_now, hdr, md_now == "tpo" or md_now == "tick_proxy" ? color.yellow : tc)
+    f_cell(3, 0, syminfo.ticker, hdr, tc)
+    f_cell(4, 0, warn, hdr, warn == "" ? tc : color.yellow)
 
     f_cell(0, 1, "Session", hdr, tc)
     f_cell(1, 1, "VAH", hdr, tc)
