@@ -2,7 +2,8 @@
 
 ## Session Value Area — Rejection & Reversion (Pine Script v6)
 
-`session_value_area_rejection.pine` — implementace zadání v3.1.
+`session_value_area_rejection.pine` — implementace zadání v3.1 s patchi
+v3.1a, v3.1b a v3.2a.
 
 Cena odmítne hranu value area **dokončené** session a uzavře zpátky uvnitř →
 vstup směrem do value area. TP1 = POC té samé session, TP2 = protilehlá hrana.
@@ -24,7 +25,7 @@ a nevydá signál.
 | 3.1 · Validita profilu | `f_make_sess` — min/max šířka VA v ATR, min barů, nulový objem |
 | 4.1 · Váhy | `i_w_poc`, `i_w_edge` |
 | 4.2 · Fixované shluky | `f_build_clusters`, volané **jen** při dokončení novější session |
-| 4.3 · Čítače na levelu | `Lvl.touch_l/touch_s/last_l/last_s` |
+| 4.3 · Čítače na levelu | `Lvl.touch_l/touch_s/last_l/last_s`, skipy `last_skip_l/last_skip_s` |
 | 5.1–5.6 · Vstupní podmínky | `f_eval` |
 | 6 · Stop-loss | `f_eval`, blok „6 stop-loss" |
 | 7.1–7.2 · Targety a posun TP1 | `f_eval`, bloky „7.1" a „7.2" |
@@ -67,9 +68,7 @@ a nevydá signál.
    oddělený od cooldownu skutečných signálů. Bez něj by při konsolidaci na
    levelu odešla notifikace na každém baru, kde platí pattern. Počet takto
    potlačených alertů je v tabulce ve sloupci `Potl. skipy`.
-6. **`skipped_concurrent`** se loguje ve formátu výsledkového alertu
-   (`{cas};{SMER};{score};{trida};skipped_concurrent;;;;`), obchod se netrackuje.
-7. Profil přiřazuje **celý objem baru do jednoho binu podle `hlc3`** přesně
+9. Profil přiřazuje **celý objem baru do jednoho binu podle `hlc3`** přesně
    podle sekce 3. Nativní TradingView Volume Profile rozpouští objem přes
    rozsah baru, takže akceptační kritérium 7 (±3 ticky) je citlivé na počet
    binů — při odchylce zvyš `Počet binů`.
