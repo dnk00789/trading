@@ -36,11 +36,11 @@ a nevydá signál.
 
 ### Rozhodnutí, která zadání nechalo otevřená
 
-1. **Vstupní alert chodí o jeden bar později.** Zadání chce v jednom řádku
-   `vstup_close` i `vstup_next_open`; open následujícího baru na close
-   signálního baru neexistuje. Alert se proto odesílá na close baru, na kterém
-   se reálně plní, a pole `cas_utc` nese čas **signálního** baru. Shape a label
-   se kreslí okamžitě na signálním baru, takže na grafu žádné zpoždění není.
+1. **Vstupní alert odchází na close signálního baru**, tedy hned když se
+   rozhoduje. Open následujícího baru v tu chvíli neexistuje, takže pole
+   `vstup_next_open` zůstává **prázdné** a reálná plnicí cena i slippage se
+   logují až v uzavíracím alertu jako dvě pole navíc na jeho konci. Plnění
+   a všechny výpočty výsledku pořád běží z open následujícího baru.
 2. **`poradi_dotyku` = pořadí signálu** na daném levelu a směru od dokončení
    session, ne pořadí každého fyzického dotyku zóny. Na 1m grafu by druhá
    varianta vyčerpala limit 2 dřív, než vůbec vznikne setup.
@@ -65,10 +65,14 @@ Vstup (sekce 9):
 {ticker};{tf};{cas_utc};{SMER};{trida};{session};{level};{cluster_members};{cluster_score};{poradi_dotyku};{vstup_close};{vstup_next_open};{SL};{TP1};{TP2};{tp1_posunuty};{tp1_confidence};{R_body};{R_atr};{tp1_v_R};{sirka_VA_atr};{pattern}
 ```
 
-Uzavření (sekce 9.3):
+`{vstup_next_open}` je ve vstupním alertu prázdné — na close signálního baru
+ještě neexistuje.
+
+Uzavření (sekce 9.3), poslední dvě pole jsou nad rámec zadání a nesou
+slippage z bodu 1 výše:
 
 ```
-{cas};{SMER};{cluster_score};{trida};{vysledek};{MFE_v_R};{MAE_v_R};{bary_do_TP1};{dosel_na_TP2}
+{cas};{SMER};{cluster_score};{trida};{vysledek};{MFE_v_R};{MAE_v_R};{bary_do_TP1};{dosel_na_TP2};{vstup_next_open};{slippage_body}
 ```
 
 `vysledek` ∈ `TP1_only` / `TP2` / `SL` / `BE` / `reversed` / `timeout` /

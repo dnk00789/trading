@@ -14,13 +14,12 @@
 //   * Dělení objemem / rozsahem je všude ošetřené proti nule; session
 //     s nulovým objemem se jen vyřadí z registru.
 //
-//  Poznámka k alertům (9.1): zadání chce ve vstupním alertu jak close
-//  signálního baru, tak open baru následujícího (reálná plnicí cena). Open
-//  dalšího baru na close signálního baru principiálně neexistuje, proto se
-//  VSTUPNÍ ALERT odesílá o jeden bar později - na close baru, na kterém se
-//  reálně plní; pole {cas_utc} přitom nese čas signálního baru. Vizuál
-//  (shape + label) se kreslí okamžitě na signálním baru, takže na grafu
-//  žádné zpoždění není. Deník tím zůstane konzistentní a slippage měřitelný.
+//  Poznámka k alertům (9.1): vstupní alert odchází na CLOSE SIGNÁLNÍHO BARU,
+//  tedy v okamžiku, kdy se rozhoduje. Open následujícího baru v tu chvíli
+//  principiálně neexistuje, takže pole {vstup_next_open} zůstává prázdné
+//  a reálná plnicí cena i slippage se logují až v uzavíracím alertu (dvě
+//  pole navíc na jeho konci). Plnění a všechny výpočty výsledku pořád běží
+//  z open následujícího baru, jak zadání chce.
 //
 //  Pořadí dotyku (5.5) se počítá jako pořadí SIGNÁLU na daném levelu a směru
 //  od dokončení session, ne jako pořadí každého fyzického dotyku zóny - na
@@ -154,6 +153,8 @@ type Cand
     float  va_atr   = na
     int    order    = 0
 
+// Signál čeká jeden bar na plnění; alert už odešel na close signálního baru,
+// takže sem stačí to, co potřebuje tracker.
 type Pend
     bool   has       = false
     int    dir       = 0
@@ -162,24 +163,14 @@ type Pend
     float  tp1       = na
     float  tp2       = na
     float  r         = na
-    float  tp1r      = na
-    bool   shifted   = false
-    string conf      = "normal"
     string cls       = ""
-    string pattern   = ""
     float  score     = 0.0
-    string members   = ""
-    string lvlname   = ""
-    string sessname  = ""
-    float  va_atr    = na
-    float  atr_at    = na
-    int    order     = 0
-    int    sig_time  = 0
 
 type Trade
-    bool   active   = false
-    int    dir      = 0
-    float  entry    = na
+    bool   active    = false
+    int    dir       = 0
+    float  entry     = na
+    float  sig_close = na
     float  sl_cur   = na
     float  tp1      = na
     float  tp2      = na
@@ -530,7 +521,11 @@ Cand candS = f_eval(-1)
 // ────────────────────────────────────────────────────────────────────────────
 
 // druhý alert po uzavření obchodu (9.3)
+// Poslední dvě pole jsou nad rámec zadání: vstupní alert odchází na close
+// signálního baru, kde open dalšího baru ještě neexistuje, takže reálná
+// plnicí cena a slippage se logují až tady. Bez nich by 9.1 nešlo změřit.
 f_close_alert(Trade t, string res) =>
+    float slip = t.dir > 0 ? t.entry - t.sig_close : t.sig_close - t.entry
     string s = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
     s := s + ";" + (t.dir > 0 ? "LONG" : "SHORT")
     s := s + ";" + f_num(t.score, "#.##")
@@ -540,6 +535,8 @@ f_close_alert(Trade t, string res) =>
     s := s + ";" + f_num(t.mae, "#.##")
     s := s + ";" + (t.bars_tp1 > 0 ? str.tostring(t.bars_tp1) : "")
     s := s + ";" + (res == "TP2" ? "ano" : "ne")
+    s := s + ";" + f_fmt(t.entry)
+    s := s + ";" + f_num(slip, "#.####")
     s
 
 bool   sig_long_plot  = false
@@ -556,37 +553,11 @@ if conf
         float R = pend.dir > 0 ? fill - pend.sl : pend.sl - fill
         if R <= 0
             R := pend.r                      // gap přes SL: ať deník nespadne
-        Trade t = Trade.new(true, pend.dir, fill, pend.sl, pend.tp1, pend.tp2, R, false, 0, 0, 0.0, 0.0, pend.cls, pend.score)
+        Trade t = Trade.new(true, pend.dir, fill, pend.sig_close, pend.sl, pend.tp1, pend.tp2, R, false, 0, 0, 0.0, 0.0, pend.cls, pend.score)
         if pend.dir > 0
             trL := t
         else
             trS := t
-        string e = syminfo.ticker
-        e := e + ";" + timeframe.period
-        e := e + ";" + str.format_time(pend.sig_time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
-        e := e + ";" + (pend.dir > 0 ? "LONG" : "SHORT")
-        e := e + ";" + pend.cls
-        e := e + ";" + pend.sessname
-        e := e + ";" + pend.lvlname
-        e := e + ";" + pend.members
-        e := e + ";" + f_num(pend.score, "#.##")
-        e := e + ";" + str.tostring(pend.order)
-        e := e + ";" + f_fmt(pend.sig_close)
-        e := e + ";" + f_fmt(fill)
-        e := e + ";" + f_fmt(pend.sl)
-        e := e + ";" + f_fmt(pend.tp1)
-        e := e + ";" + f_fmt(pend.tp2)
-        e := e + ";" + (pend.shifted ? "ano" : "ne")
-        e := e + ";" + pend.conf
-        float r_atr = na
-        if pend.atr_at > 0
-            r_atr := pend.r / pend.atr_at
-        e := e + ";" + f_num(pend.r, "#.####")
-        e := e + ";" + f_num(r_atr, "#.##")
-        e := e + ";" + f_num(pend.tp1r, "#.##")
-        e := e + ";" + f_num(pend.va_atr, "#.##")
-        e := e + ";" + pend.pattern
-        a_entry := e
         pend := Pend.new()
 
     // ── 2) průběh běžících obchodů (9.2: při souběhu TP a SL platí SL) ───
@@ -666,7 +637,37 @@ if conf
                 else
                     a_exitL := f_close_alert(trL, "reversed")
                     trL.active := false
-            pend := Pend.new(true, dr, cd.entry, cd.sl, cd.tp1, cd.tp2, cd.r, cd.tp1r, cd.shifted, cd.conf, cd.cls, cd.pattern, cd.score, cd.members, cd.lvlname, cd.sessname, cd.va_atr, atr, cd.order, time)
+            pend := Pend.new(true, dr, cd.entry, cd.sl, cd.tp1, cd.tp2, cd.r, cd.cls, cd.score)
+
+            // vstupní alert na close signálního baru; {vstup_next_open} tady
+            // ještě neexistuje a plní se prázdný - reálná plnicí cena
+            // a slippage jdou do uzavíracího alertu
+            float r_atr = na
+            if atr > 0
+                r_atr := cd.r / atr
+            string e = syminfo.ticker
+            e := e + ";" + timeframe.period
+            e := e + ";" + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+            e := e + ";" + (dr > 0 ? "LONG" : "SHORT")
+            e := e + ";" + cd.cls
+            e := e + ";" + cd.sessname
+            e := e + ";" + cd.lvlname
+            e := e + ";" + cd.members
+            e := e + ";" + f_num(cd.score, "#.##")
+            e := e + ";" + str.tostring(cd.order)
+            e := e + ";" + f_fmt(cd.entry)
+            e := e + ";"
+            e := e + ";" + f_fmt(cd.sl)
+            e := e + ";" + f_fmt(cd.tp1)
+            e := e + ";" + f_fmt(cd.tp2)
+            e := e + ";" + (cd.shifted ? "ano" : "ne")
+            e := e + ";" + cd.conf
+            e := e + ";" + f_num(cd.r, "#.####")
+            e := e + ";" + f_num(r_atr, "#.##")
+            e := e + ";" + f_num(cd.tp1r, "#.##")
+            e := e + ";" + f_num(cd.va_atr, "#.##")
+            e := e + ";" + cd.pattern
+            a_entry := e
 
             if dr > 0
                 sig_long_plot := true
