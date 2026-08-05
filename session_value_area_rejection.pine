@@ -1,0 +1,1024 @@
+//@version=6
+// ============================================================================
+//  Session Value Area — Rejection & Reversion
+//  zadání v3.1 + patche v3.1a, v3.1b, v3.2a
+// ----------------------------------------------------------------------------
+//  Princip: cena odmítne hranu value area DOKONČENÉ session a uzavře zpátky
+//  dovnitř -> vstup směrem do value area. TP1 = POC té samé session,
+//  TP2 = protilehlá hrana. Levely naskládané na sobě (shluky) váží víc.
+//
+//  Nefunkční požadavky (sekce 1):
+//   * Žádný repaint - veškerá stavová logika běží pod barstate.isconfirmed.
+//   * Žádné request.security().
+//   * Všechny prahy v násobcích ATR. Jediné absolutní číslo je TP offset,
+//     který je záměrně v tickách instrumentu.
+//   * Dělení objemem / rozsahem je všude ošetřené proti nule; session
+//     s nulovým objemem se jen vyřadí z registru.
+//
+//  Poznámka k alertům (9.1): vstupní alert odchází na CLOSE SIGNÁLNÍHO BARU,
+//  tedy v okamžiku, kdy se rozhoduje. Open následujícího baru v tu chvíli
+//  principiálně neexistuje, takže pole {vstup_next_open} zůstává prázdné
+//  a reálná plnicí cena i slippage se logují až v uzavíracím alertu.
+//  Plnění a všechny výpočty výsledku běží z open následujícího baru.
+//
+//  Pořadí dotyku (5.5) se počítá jako pořadí SIGNÁLU na daném levelu a směru
+//  od dokončení session, ne jako pořadí každého fyzického dotyku zóny - na
+//  1m grafu by druhá varianta vyčerpala limit dřív, než vůbec vznikne setup.
+//
+//  Protichůdné signály na jednom baru se navzájem ruší. V zadání to není,
+//  ale long a short současně na stejném baru je artefakt, ne obchod.
+//
+// ----------------------------------------------------------------------------
+//  POŘADÍ POLÍ V ALERTECH - nová pole se přidávají VÝHRADNĚ NA KONEC, jinak
+//  se znehodnotí všechno, co je do té chvíle zalogované.
+//
+//  VSTUPNÍ ALERT (24 polí):
+//   1 ticker · 2 tf · 3 cas_utc · 4 SMER · 5 trida · 6 session · 7 level
+//   8 cluster_members · 9 cluster_score · 10 poradi_dotyku · 11 vstup_close
+//   12 vstup_next_open (vždy prázdné) · 13 SL · 14 TP1 · 15 TP2
+//   16 tp1_posunuty · 17 tp1_confidence · 18 R_body · 19 R_atr · 20 tp1_v_R
+//   21 sirka_VA_atr · 22 pattern · 23 profil_rezim · 24 symbol
+//
+//  UZAVÍRACÍ ALERT (15 polí) - stejný formát mají i všechny skipped_* řádky,
+//  s prázdnými poli tam, kde hodnota neexistuje:
+//   1 cas · 2 SMER · 3 cluster_score · 4 trida · 5 vysledek · 6 MFE_v_R
+//   7 MAE_v_R · 8 bary_do_TP1 · 9 dosel_na_TP2 · 10 vstup_next_open
+//   11 slippage_body · 12 realized_R · 13 tp1_v_R_fill · 14 profil_rezim
+//   15 symbol
+//
+//  vysledek: SL · TP1_BE · TP2 · TP1_open · timeout · reversed ·
+//            skipped_concurrent · skipped_gap · skipped_slippage
+//
+//  realized_R respektuje dělenou pozici (i_tp1_pct): obchod, který vybral
+//  TP1 a pak se vrátil na break-even, je TP1_BE s kladným realized_R, ne
+//  nula. Bez toho deník podhodnocuje výkon v nejčastějším scénáři.
+//
+// ----------------------------------------------------------------------------
+//  ZDROJ PROFILU (profil_rezim) - eviduje se v obou alertech, protože stejná
+//  logika běží na burzovním i na CFD feedu a v jedné tabulce se ta dvě čísla
+//  nesmí smíchat. Do binů jde u vol i tick TÁŽ proměnná, rozlišení je čistě
+//  evidenční: tick volume měří počet změn ceny, ne velikost obchodů, takže
+//  value area z něj může vyjít jinde.
+//
+//   vol        burzovní feed (krypto, ES1!, NQ1!, GC1!)      -> volume
+//   tick       CFD / FX feed, volume nenulové                -> volume
+//              (rozpozná se podle syminfo.type cfd / forex)     (= tick volume)
+//   tpo        volume je na nebo nulové ve víc než polovině  -> 1 za bar
+//              barů session
+//   tick_proxy feed objem nedá vůbec; příspěvkem baru je     -> počet LTF barů
+//              počet barů nižšího timeframu, které do něj
+//              spadnou. VOLITELNÝ, v defaultu vypnutý.
+//
+//  POZOR na tick_proxy: request.security_lower_tf() má strop na počtu
+//  načtených LTF barů, takže historie bude výrazně kratší než u ostatních
+//  režimů. Pro živé obchodování to nevadí, pro ruční procházení historie ano.
+//  Cena do binu se i v tomhle režimu bere z hlc3 baru grafu, ne z LTF dat.
+//
+// ----------------------------------------------------------------------------
+//  DOPORUČENÉ SYMBOLY
+//
+//   S&P 500 (CFD broker)     US500 / SPX500 dle feedu   profil: tick
+//   S&P 500 (futures)        ES1!                       profil: vol
+//   S&P 500 (index)          SPX                        NEPOUŽÍVAT, nemá objem
+//   Nasdaq (CFD broker)      US100 / NAS100 dle feedu   profil: tick
+//   Nasdaq (futures)         NQ1!                       profil: vol
+//   Nasdaq (index)           NDX                        NEPOUŽÍVAT, nemá objem
+//
+//  Sloupec "Preset" ze zadání tu není - presety parametrů podle třídy
+//  instrumentu v tomhle buildu neexistují, přišly by až s v3.2.
+// ============================================================================
+
+indicator("Session Value Area — Rejection & Reversion v3.2a", "SVA-RR", overlay = true, max_boxes_count = 100, max_labels_count = 500, max_lines_count = 100, max_bars_back = 500)
+
+// ────────────────────────────────────────────────────────────────────────────
+//  INPUTS
+// ────────────────────────────────────────────────────────────────────────────
+var string G_SESS = "1 · Sessions"
+i_tz    = input.string("America/New_York", "Timezone",               group = G_SESS)
+i_tok   = input.string("19:00",            "Start Tokyo (HH:MM)",    group = G_SESS)
+i_lon   = input.string("03:00",            "Start London (HH:MM)",   group = G_SESS)
+i_ny    = input.string("09:30",            "Start New York (HH:MM)", group = G_SESS)
+
+var string G_PROF = "2 · Profil / Value area"
+i_prof_src = input.string("auto", "Zdroj profilu", options = ["auto", "vol", "tick", "tpo", "tick_proxy"], group = G_PROF)
+i_ltf      = input.timeframe("1", "Tick-proxy: nižší timeframe", group = G_PROF)
+i_bins    = input.int(50,    "Počet binů",   minval = 5,  maxval = 500, group = G_PROF)
+i_va_pct  = input.float(70,  "Value area %", minval = 30, maxval = 95,  group = G_PROF)
+i_atr_len = input.int(14,    "ATR délka",    minval = 2,                group = G_PROF)
+
+var string G_VAL = "3 · Validita session"
+i_min_va   = input.float(1.0, "Min šířka VA (× ATR)", minval = 0,   step = 0.1, group = G_VAL)
+i_max_va   = input.float(6.0, "Max šířka VA (× ATR)", minval = 0.1, step = 0.1, group = G_VAL)
+i_min_bars = input.int(20,    "Min barů v session",   minval = 1,               group = G_VAL)
+
+var string G_CLU = "4 · Registr a shluky"
+i_w_poc   = input.float(1.5,  "Váha POC",                 minval = 0, step = 0.1,  group = G_CLU)
+i_w_edge  = input.float(1.0,  "Váha VAH / VAL",           minval = 0, step = 0.1,  group = G_CLU)
+i_clu_tol = input.float(0.20, "Tolerance shluku (× ATR)", minval = 0, step = 0.01, group = G_CLU)
+
+var string G_ENTRY = "5 · Vstup"
+i_tol       = input.float(0.25, "Tolerance dotyku/průrazu (× ATR)",  minval = 0,    step = 0.01, group = G_ENTRY)
+i_look      = input.int(5,      "Origin lookback (barů)",            minval = 2,                 group = G_ENTRY)
+i_min_in    = input.int(3,      "Origin — min barů uvnitř VA",       minval = 1,                 group = G_ENTRY)
+i_reclaim   = input.bool(false, "Povolit reclaim (třída B)",                                     group = G_ENTRY)
+i_min_wick  = input.float(0.50, "Pattern A — min knot / rozsah",     minval = 0.05, step = 0.05, group = G_ENTRY)
+i_win       = input.int(3,      "Pattern B — okno barů",             minval = 2,                 group = G_ENTRY)
+i_min_touch = input.int(2,      "Pattern B — min dotyků",            minval = 1,                 group = G_ENTRY)
+i_min_score = input.float(1.0,  "Min skóre shluku",                  minval = 0,    step = 0.5,  group = G_ENTRY)
+i_min_pocd  = input.float(0.8,  "Min vzdálenost k POC (× ATR)",      minval = 0,    step = 0.1,  group = G_ENTRY)
+i_min_tp1r  = input.float(1.0,  "Min TP1 v R (na close signálu)",    minval = 0,    step = 0.1,  group = G_ENTRY)
+i_min_tp1rf = input.float(0.0,  "Min TP1 v R po plnění (0 = vyp.)",  minval = 0,    step = 0.1,  group = G_ENTRY)
+i_max_touch = input.int(2,      "Max pořadí dotyku levelu",          minval = 1,                 group = G_ENTRY)
+
+var string G_RISK = "6 · Stop-loss"
+i_sl_buf = input.float(0.15, "SL buffer (× ATR)", minval = 0,    step = 0.05, group = G_RISK)
+i_max_sl = input.float(1.0,  "Max R (× ATR)",     minval = 0.1,  step = 0.05, group = G_RISK)
+i_min_sl = input.float(0.25, "Min R (× ATR)",     minval = 0.01, step = 0.05, group = G_RISK)
+
+var string G_TP = "7 · Targety"
+i_tp_off   = input.int(3,     "TP offset (ticků)",      minval = 0,              group = G_TP)
+i_tp1_pct  = input.float(70,  "Velikost TP1 (% pozice)", minval = 1, maxval = 100, group = G_TP)
+i_block    = input.float(2.0, "Blokující skóre shluku", minval = 0, step = 0.5,  group = G_TP)
+i_max_hold = input.int(100,   "Max barů v obchodu",     minval = 5,              group = G_TP)
+
+var string G_FILT = "8 · Ostatní filtry"
+i_cooldown = input.int(20,               "Cooldown (barů, per level+směr)", minval = 0,             group = G_FILT)
+i_window   = input.session("0000-2400",  "Časové okno obchodování",                                 group = G_FILT)
+i_min_atrp = input.float(0.0,            "Min ATR jako % ceny",             minval = 0, step = 0.01, group = G_FILT)
+
+var string G_VIS = "9 · Vizuál"
+i_show_lvls = input.bool(true, "Kreslit levely",          group = G_VIS)
+i_show_va   = input.bool(true, "Vyplnit value area",      group = G_VIS)
+i_show_clu  = input.bool(true, "Boxy shluků (skóre ≥ 2)", group = G_VIS)
+i_show_tbl  = input.bool(true, "Tabulka",                 group = G_VIS)
+i_col_tok   = input.color(#26a69a, "Barva Tokyo",  group = G_VIS)
+i_col_lon   = input.color(#42a5f5, "Barva London", group = G_VIS)
+i_col_ny    = input.color(#ef5350, "Barva NY",     group = G_VIS)
+
+// ────────────────────────────────────────────────────────────────────────────
+//  TYPY
+// ────────────────────────────────────────────────────────────────────────────
+type Sess
+    string name      = ""
+    string abbr      = ""
+    int    sid       = -1
+    float  vah       = na
+    float  poc       = na
+    float  poc_low   = na
+    float  poc_high  = na
+    float  val       = na
+    float  atr_done  = na
+    int    done_bar  = 0
+    int    nbars     = 0
+    string mode      = "vol"
+
+// last_l / last_s drží cooldown SKUTEČNÝCH signálů, last_skip_* je oddělený
+// cooldown pro zahozené (skipped_concurrent) - jinak by při běžícím obchodu
+// odešla notifikace na každém baru, kde platí pattern.
+type Lvl
+    int    slot        = 0       // 0 = starší session, 1 = novější
+    string sess_name   = ""
+    string abbr        = ""      // "LonVAL"
+    int    ltype       = 0       // 0 = VAL, 1 = POC, 2 = VAH
+    string tname       = ""
+    float  price       = na
+    float  w           = 0.0
+    int    touch_l     = 0
+    int    touch_s     = 0
+    int    last_l      = -100000
+    int    last_s      = -100000
+    int    last_skip_l = -100000
+    int    last_skip_s = -100000
+    int    skip_sup    = 0
+
+type Clu
+    string id      = ""
+    float  price   = na
+    float  score   = 0.0
+    string members = ""
+    float  lo      = na
+    float  hi      = na
+    bool   has_val = false
+    bool   has_vah = false
+    bool   has_poc = false
+    int    val_lvl = -1
+    int    vah_lvl = -1
+
+type Cand
+    bool   ok       = false
+    int    ci       = -1
+    int    li       = -1
+    float  entry    = na
+    float  sl       = na
+    float  tp1      = na
+    float  tp2      = na
+    float  r        = na
+    float  tp1r     = na
+    bool   shifted  = false
+    string conf     = "normal"
+    string cls      = ""
+    string pattern  = ""
+    float  score    = 0.0
+    string members  = ""
+    string lvlname  = ""
+    string sessname = ""
+    float  va_atr   = na
+    int    order    = 0
+    string mode     = "vol"
+
+// Signál čeká jeden bar na plnění; alert už odešel na close signálního baru,
+// takže sem stačí to, co potřebuje tracker.
+// lvl_idx, prev_last a seq slouží k vrácení dotyku, když plnění nevyjde:
+// gap se pozná až o bar později, ale čítač už je spotřebovaný. seq je clu_seq
+// v okamžiku signálu - když se mezitím přestavěly levely, dotyk se nevrací,
+// protože level, kterého se to týkalo, už neexistuje.
+type Pend
+    bool   has       = false
+    int    dir       = 0
+    float  sig_close = na
+    float  sl        = na
+    float  tp1       = na
+    float  tp2       = na
+    float  r         = na
+    string cls       = ""
+    float  score     = 0.0
+    int    lvl_idx   = -1
+    int    prev_last = -100000
+    int    seq       = 0
+    string mode      = "vol"
+
+// r, tp1r_fill i tp2r_fill jsou přepočítané z REÁLNÉ plnicí ceny, ne z close
+// signálního baru - po gapu se plán a realita můžou lišit o desetiny R.
+type Trade
+    bool   active    = false
+    int    dir       = 0
+    float  entry     = na
+    float  sig_close = na
+    float  sl_cur    = na
+    float  tp1       = na
+    float  tp2       = na
+    float  r         = na
+    float  tp1r_fill = na
+    float  tp2r_fill = na
+    bool   tp1_hit   = false
+    int    bars      = 0
+    int    bars_tp1  = 0
+    float  mfe       = 0.0
+    float  mae       = 0.0
+    string cls       = ""
+    float  score     = 0.0
+    string mode      = "vol"
+
+// ────────────────────────────────────────────────────────────────────────────
+//  POMOCNÉ FUNKCE
+// ────────────────────────────────────────────────────────────────────────────
+
+// "HH:MM" -> minuta dne (při nesmyslném vstupu 0)
+f_hm(string s) =>
+    array<string> p = str.split(s, ":")
+    float hh = p.size() > 0 ? str.tonumber(str.replace_all(p.get(0), " ", "")) : na
+    float mm = p.size() > 1 ? str.tonumber(str.replace_all(p.get(1), " ", "")) : na
+    int h = na(hh) ? 0 : int(math.max(0, math.min(23, math.round(hh))))
+    int m = na(mm) ? 0 : int(math.max(0, math.min(59, math.round(mm))))
+    h * 60 + m
+
+// minuta dne -> id session (0 Tokyo, 1 London, 2 NY)
+// Sessions se definují jen počátečním časem, každá běží do startu následující.
+f_sess_of(int m, int a, int b, int c) =>
+    array<int> st = array.from(a, b, c)
+    int best  = -1
+    int bestv = -1
+    for i = 0 to 2
+        int s = st.get(i)
+        if m >= s and s > bestv
+            bestv := s
+            best  := i
+    if best == -1
+        // před nejranějším startem dne -> session přetékající z včerejška
+        for i = 0 to 2
+            int s = st.get(i)
+            if s > bestv
+                bestv := s
+                best  := i
+    best
+
+f_sname(int sid) => sid == 0 ? "Tokyo" : sid == 1 ? "London" : "NY"
+f_sabbr(int sid) => sid == 0 ? "Tok" : sid == 1 ? "Lon" : "NY"
+f_scol(int sid)  => sid == 0 ? i_col_tok : sid == 1 ? i_col_lon : i_col_ny
+f_fmt(float x)   => str.tostring(x, format.mintick)
+f_num(float x, string f) => str.tostring(x, f)
+
+// Volume profil dokončené session + kontrola validity (3.1).
+// Vrací hotový Sess, nebo na, pokud session z registru vypadává.
+f_make_sess(array<float> px, array<float> vl, int sid, float a_now, string mode) =>
+    Sess r = na
+    int   n   = px.size()
+    bool  tpo = mode == "tpo"
+    float tot = n > 0 ? (tpo ? n : vl.sum()) : 0.0
+    float lo  = n > 0 ? px.min() : na
+    float hi  = n > 0 ? px.max() : na
+    bool basics = n >= i_min_bars and tot > 0 and not na(lo) and not na(hi) and hi > lo
+    if basics and not na(a_now) and a_now > 0
+        float w = (hi - lo) / i_bins
+        array<float> bins = array.new<float>(i_bins, 0.0)
+        for i = 0 to n - 1
+            int idx = int(math.floor((px.get(i) - lo) / w))
+            idx := math.max(0, math.min(i_bins - 1, idx))
+            bins.set(idx, bins.get(idx) + (tpo ? 1.0 : vl.get(i)))
+        int   pi = 0
+        float pv = -1.0
+        for i = 0 to i_bins - 1
+            if bins.get(i) > pv
+                pv := bins.get(i)
+                pi := i
+        // rozšiřování value area od POC vždy na stranu s vyšším objemem
+        float target = tot * i_va_pct / 100.0
+        float acc = bins.get(pi)
+        int   up  = pi + 1
+        int   dn  = pi - 1
+        for _i = 0 to i_bins
+            if acc >= target or (up > i_bins - 1 and dn < 0)
+                break
+            float vu = up <= i_bins - 1 ? bins.get(up) : -1.0
+            float vd = dn >= 0 ? bins.get(dn) : -1.0
+            if vu >= vd
+                acc := acc + vu
+                up  := up + 1
+            else
+                acc := acc + vd
+                dn  := dn - 1
+        float vah = lo + up * w
+        float val = lo + (dn + 1) * w
+        float pl  = lo + pi * w
+        float ph  = lo + (pi + 1) * w
+        float wdt = vah - val
+        // mrtvá session / trendová session -> celá se vyřadí
+        if wdt >= i_min_va * a_now and wdt <= i_max_va * a_now
+            r := Sess.new(f_sname(sid), f_sabbr(sid), sid, vah, (pl + ph) / 2.0, pl, ph, val, a_now, bar_index, n, mode)
+    r
+
+// 6 levelů ze dvou aktivních sessions (4.1)
+f_build_levels(Sess s0, Sess s1) =>
+    array<Lvl> a = array.new<Lvl>()
+    for slot = 0 to 1
+        Sess s = slot == 0 ? s0 : s1
+        if not na(s)
+            a.push(Lvl.new(slot, s.name, s.abbr + "VAL", 0, "VAL", s.val, i_w_edge))
+            a.push(Lvl.new(slot, s.name, s.abbr + "POC", 1, "POC", s.poc, i_w_poc))
+            a.push(Lvl.new(slot, s.name, s.abbr + "VAH", 2, "VAH", s.vah, i_w_edge))
+    a
+
+// Shluky (4.2). Počítají se PRÁVĚ JEDNOU, při dokončení novější ze dvou
+// aktivních sessions, s ATR platným v tom okamžiku - a pak se zafixují.
+f_build_clusters(array<Lvl> lv, float tol, int seq) =>
+    array<Clu> cs = array.new<Clu>()
+    int n = lv.size()
+    if n > 0
+        array<float> pr = array.new<float>()
+        for i = 0 to n - 1
+            pr.push(lv.get(i).price)
+        array<int> ord = pr.sort_indices(order.ascending)
+        int i = 0
+        int k = 0
+        while i < n
+            int j = i
+            while j + 1 < n and (pr.get(ord.get(j + 1)) - pr.get(ord.get(j))) <= tol
+                j := j + 1
+            Clu   c     = Clu.new("C" + str.tostring(seq) + "-" + str.tostring(k))
+            float sum   = 0.0
+            int   cnt   = 0
+            float pocpx = na
+            int   pocsl = -1
+            for q = i to j
+                int li = ord.get(q)
+                Lvl L  = lv.get(li)
+                c.score   := c.score + L.w
+                c.members := c.members == "" ? L.abbr : c.members + "+" + L.abbr
+                c.lo      := na(c.lo) ? L.price : math.min(c.lo, L.price)
+                c.hi      := na(c.hi) ? L.price : math.max(c.hi, L.price)
+                sum       := sum + L.price
+                cnt       := cnt + 1
+                if L.ltype == 0
+                    if not c.has_val or L.slot == 1
+                        c.val_lvl := li
+                    c.has_val := true
+                if L.ltype == 2
+                    if not c.has_vah or L.slot == 1
+                        c.vah_lvl := li
+                    c.has_vah := true
+                if L.ltype == 1
+                    c.has_poc := true
+                    if na(pocpx) or L.slot > pocsl
+                        pocpx := L.price
+                        pocsl := L.slot
+            // cena shluku: POC (při dvou POC ta z novější session), jinak průměr
+            c.price := c.has_poc ? pocpx : sum / cnt
+            cs.push(c)
+            k := k + 1
+            i := j + 1
+    cs
+
+// ────────────────────────────────────────────────────────────────────────────
+//  STAV
+// ────────────────────────────────────────────────────────────────────────────
+float atr  = ta.atr(i_atr_len)
+bool  conf = barstate.isconfirmed
+
+var array<float> acc_px  = array.new<float>()
+var array<float> acc_vol = array.new<float>()
+var int   cur_sid  = -1
+var int   cur_bars = 0
+var int   cur_zero = 0
+
+var Sess sess0 = na                        // starší z dvojice
+var Sess sess1 = na                        // novější z dvojice
+var array<Lvl> levels    = array.new<Lvl>()
+var array<Clu> clusters  = array.new<Clu>()
+var array<box> clu_boxes = array.new<box>()
+var int   clu_seq      = 0
+var float clu_tol_used = na
+
+var Pend  pend = Pend.new()
+var Trade trL  = Trade.new()
+var Trade trS  = Trade.new()
+
+int s_tok = f_hm(i_tok)
+int s_lon = f_hm(i_lon)
+int s_ny  = f_hm(i_ny)
+
+// Zdroj profilu. U vol i tick jde do binů táž proměnná - rozlišení je čistě
+// evidenční, ale ve statistice musíš vědět, ze kterého světa obchod pochází.
+bool  feed_tick = syminfo.type == "cfd" or syminfo.type == "forex"
+bool  ltf_ok    = timeframe.in_seconds(i_ltf) < timeframe.in_seconds(timeframe.period)
+bool  proxy_on  = i_prof_src == "tick_proxy" and ltf_ok
+int   ltf_n = 0
+if proxy_on
+    // v6 dynamic requests: request.* smí být v lokálním scope
+    array<float> lt = request.security_lower_tf(syminfo.tickerid, i_ltf, close)
+    ltf_n := na(lt) ? 0 : lt.size()
+
+bool  tf_ok   = timeframe.in_seconds() <= 900
+bool  in_win  = not na(time(timeframe.period, i_window, i_tz))
+float atr_pct = close > 0 and not na(atr) ? atr / close * 100.0 : na
+bool  vol_ok  = i_min_atrp <= 0 or (not na(atr_pct) and atr_pct >= i_min_atrp)
+
+// ────────────────────────────────────────────────────────────────────────────
+//  STAVOVÝ AUTOMAT SESSIONS  (jen uzavřené bary → žádný repaint)
+// ────────────────────────────────────────────────────────────────────────────
+if conf
+    int m   = hour(time, i_tz) * 60 + minute(time, i_tz)
+    int sid = f_sess_of(m, s_tok, s_lon, s_ny)
+
+    if sid != cur_sid
+        // ── dokončení předchozí session ──────────────────────────────────
+        if cur_sid >= 0 and cur_bars > 0
+            // tpo se pozná až tady - podíl barů bez objemu je znám až na konci
+            string md = "vol"
+            if proxy_on
+                md := "tick_proxy"
+            else if i_prof_src == "vol" or i_prof_src == "tick" or i_prof_src == "tpo"
+                md := i_prof_src
+            else
+                md := cur_zero * 2 > cur_bars ? "tpo" : (feed_tick ? "tick" : "vol")
+            Sess s = f_make_sess(acc_px, acc_vol, cur_sid, atr, md)
+            if not na(s)
+                sess0 := sess1
+                sess1 := s
+                // registr i shluky se přepočítají teď a pak už nikdy
+                if not na(sess0)
+                    levels       := f_build_levels(sess0, sess1)
+                    clu_tol_used := i_clu_tol * atr
+                    clu_seq      := clu_seq + 1
+                    clusters     := f_build_clusters(levels, clu_tol_used, clu_seq)
+                    if clu_boxes.size() > 0
+                        for bi = 0 to clu_boxes.size() - 1
+                            box.delete(clu_boxes.get(bi))
+                        clu_boxes.clear()
+                    if i_show_clu and clusters.size() > 0
+                        float pad = math.max(clu_tol_used * 0.25, syminfo.mintick)
+                        for ci = 0 to clusters.size() - 1
+                            Clu c = clusters.get(ci)
+                            if c.score >= 2.0
+                                clu_boxes.push(box.new(bar_index, c.hi + pad, bar_index + 1, c.lo - pad, border_color = color.new(color.orange, 40), bgcolor = color.new(color.orange, 88), extend = extend.right))
+        // ── start nové session ───────────────────────────────────────────
+        acc_px.clear()
+        acc_vol.clear()
+        cur_bars := 0
+        cur_zero := 0
+        cur_sid  := sid
+
+    // ── akumulace profilu běžící session (jinak se běžící session nepoužívá)
+    bool no_vol = na(volume) or volume <= 0
+    float v = no_vol ? 0.0 : volume
+    if proxy_on
+        // příspěvkem baru je počet barů nižšího TF, které do něj spadly
+        v := ltf_n > 0 ? ltf_n : 1.0
+    acc_px.push(hlc3)
+    acc_vol.push(v)
+    cur_bars := cur_bars + 1
+    if no_vol
+        cur_zero := cur_zero + 1
+
+// Studený start (2.1)
+bool ready = not na(sess0) and not na(sess1) and clusters.size() > 0
+
+// ────────────────────────────────────────────────────────────────────────────
+//  VYHODNOCENÍ VSTUPU  (5.1–5.6, 6, 7.1, 7.2)
+//  dir = +1 LONG (shluk obsahuje VAL), dir = -1 SHORT (shluk obsahuje VAH)
+// ────────────────────────────────────────────────────────────────────────────
+f_eval(int dir) =>
+    Cand best = Cand.new()
+    if ready and not na(atr) and atr > 0 and tf_ok and in_win and vol_ok
+        float tol = i_tol * atr
+        float off = i_tp_off * syminfo.mintick
+        for ci = 0 to clusters.size() - 1
+            Clu  c   = clusters.get(ci)
+            bool has = dir > 0 ? c.has_val : c.has_vah
+            int  li  = dir > 0 ? c.val_lvl : c.vah_lvl
+            // 5.3 min skóre + 5.6 jeden signál na shluk (bere se nejsilnější)
+            if has and li >= 0 and c.score >= i_min_score and c.score > best.score
+                Lvl   L    = levels.get(li)
+                Sess  S    = L.slot == 1 ? sess1 : sess0
+                float lref = dir > 0 ? S.val : S.vah
+
+                // 5.1a stavová podmínka
+                bool state = dir > 0 ? close > lref : close < lref
+                if state
+                    // 5.1b podmínka původu - čte VÝHRADNĚ bary před signálním,
+                    // signální bar je stavovou podmínkou vždy na správné
+                    // straně a počítal by se do "uvnitř VA" zadarmo
+                    int inside = 0
+                    int breach = 0
+                    for i = 0 to i_look - 1
+                        float cl = close[i + 1]
+                        if cl >= S.val and cl <= S.vah
+                            inside := inside + 1
+                        if (dir > 0 and cl < S.val - tol) or (dir < 0 and cl > S.vah + tol)
+                            breach := breach + 1
+                    string cls = breach == 0 and inside >= i_min_in ? "A" : breach > 0 ? "B" : ""
+                    bool cls_ok = cls == "A" or (cls == "B" and i_reclaim)
+
+                    // 5.2 rejection pattern; dotyk se testuje proti zóně shluku
+                    float zlo  = c.lo - tol
+                    float zhi  = c.hi + tol
+                    float rng  = high - low
+                    float wick = dir > 0 ? math.min(open, close) - low : high - math.max(open, close)
+                    float ext  = dir > 0 ? low : high
+                    bool  pA   = rng > 0 and (wick / rng) >= i_min_wick and ext >= zlo and ext <= zhi
+                    int  touches   = 0
+                    bool all_state = true
+                    for i = 0 to i_win - 1
+                        float e = dir > 0 ? low[i] : high[i]
+                        if e >= zlo and e <= zhi
+                            touches := touches + 1
+                            bool st = dir > 0 ? close[i] > lref : close[i] < lref
+                            if not st
+                                all_state := false
+                    bool better = dir > 0 ? close > close[1] : close < close[1]
+                    bool pB = touches >= i_min_touch and all_state and better
+
+                    if cls_ok and (pA or pB)
+                        // 5.5 pořadí dotyku + 8.1 cooldown (per level a směr)
+                        int  last     = dir > 0 ? L.last_l : L.last_s
+                        int  ordn     = (dir > 0 ? L.touch_l : L.touch_s) + 1
+                        bool cd_ok    = (bar_index - last) >= i_cooldown
+                        bool touch_ok = ordn <= i_max_touch
+
+                        // 6 stop-loss
+                        float entry = close
+                        float sl = dir > 0 ? math.min(low, c.lo) - i_sl_buf * atr : math.max(high, c.hi) + i_sl_buf * atr
+                        float R = dir > 0 ? entry - sl : sl - entry
+                        bool r_ok = R > 0 and R >= i_min_sl * atr and R <= i_max_sl * atr
+
+                        // 7.1 targety, vždy ze session S (té, ze které je level)
+                        float poc_edge = dir > 0 ? S.poc_low : S.poc_high
+                        float tp1 = dir > 0 ? poc_edge - off : poc_edge + off
+                        float tp2 = dir > 0 ? S.vah - off : S.val + off
+
+                        // 7.2 posun TP1 před blokující shluk
+                        bool   shifted = false
+                        string cfd = "normal"
+                        float  blk = na
+                        for k = 0 to clusters.size() - 1
+                            if k != ci
+                                Clu d = clusters.get(k)
+                                if d.score >= i_block
+                                    bool near_poc = d.hi >= S.poc_low - tol and d.lo <= S.poc_high + tol
+                                    if near_poc
+                                        // shluk leží na POC nebo těsně za ním
+                                        cfd := "high"
+                                    else if dir > 0 and d.lo > entry and d.hi < S.poc_low - tol
+                                        blk := na(blk) ? d.lo : math.min(blk, d.lo)
+                                    else if dir < 0 and d.hi < entry and d.lo > S.poc_high + tol
+                                        blk := na(blk) ? d.hi : math.max(blk, d.hi)
+                        if not na(blk)
+                            tp1 := dir > 0 ? blk - off : blk + off
+                            shifted := true
+
+                        // 5.4 absolutní + poměrový filtr (poměrový až po posunu)
+                        float dist = dir > 0 ? S.poc_low - entry : entry - S.poc_high
+                        bool  dist_ok = dist >= i_min_pocd * atr
+                        float tp1r = na
+                        if R > 0
+                            tp1r := dir > 0 ? (tp1 - entry) / R : (entry - tp1) / R
+                        bool  ratio_ok = not na(tp1r) and tp1r >= i_min_tp1r
+
+                        if cd_ok and touch_ok and r_ok and dist_ok and ratio_ok
+                            float aref = S.atr_done > 0 ? S.atr_done : atr
+                            Cand cnd = Cand.new(true, ci, li, entry, sl, tp1, tp2, R, tp1r, shifted, cfd, cls, pA ? "A" : "B", c.score, c.members, L.tname, S.name, (S.vah - S.val) / aref, ordn, S.mode)
+                            best := cnd
+    best
+
+Cand candL = f_eval(1)
+Cand candS = f_eval(-1)
+
+// ────────────────────────────────────────────────────────────────────────────
+//  TRACKER + ALERTY
+// ────────────────────────────────────────────────────────────────────────────
+
+// Druhý alert po uzavření obchodu (9.3), 15 polí - pořadí viz hlavička.
+// realized_R respektuje dělenou pozici: TP1 vybere i_tp1_pct procent, zbytek
+// dojede na TP2, break-even stop, timeout nebo obrat.
+f_close_alert(Trade t, string res) =>
+    float slip = t.dir > 0 ? t.entry - t.sig_close : t.sig_close - t.entry
+    float p    = i_tp1_pct / 100.0
+    float openr = na
+    if t.r > 0
+        openr := (t.dir > 0 ? close - t.entry : t.entry - close) / t.r
+    float realized = na
+    if res == "SL"
+        realized := -1.0
+    else if res == "TP1_BE"
+        realized := p * t.tp1r_fill
+    else if res == "TP2"
+        realized := p * t.tp1r_fill + (1.0 - p) * t.tp2r_fill
+    else if res == "TP1_open"
+        realized := p * t.tp1r_fill + (1.0 - p) * openr
+    else if t.tp1_hit
+        // reversed po zásahu TP1: zbytek ven za aktuální cenu
+        realized := p * t.tp1r_fill + (1.0 - p) * openr
+    else
+        realized := openr
+    string s = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+    s := s + ";" + (t.dir > 0 ? "LONG" : "SHORT")
+    s := s + ";" + f_num(t.score, "#.##")
+    s := s + ";" + t.cls
+    s := s + ";" + res
+    s := s + ";" + f_num(t.mfe, "#.##")
+    s := s + ";" + f_num(t.mae, "#.##")
+    s := s + ";" + (t.bars_tp1 > 0 ? str.tostring(t.bars_tp1) : "")
+    s := s + ";" + (res == "TP2" ? "ano" : "ne")
+    s := s + ";" + f_fmt(t.entry)
+    s := s + ";" + f_num(slip, "#.####")
+    s := s + ";" + f_num(realized, "#.###")
+    s := s + ";" + f_num(t.tp1r_fill, "#.##")
+    s := s + ";" + t.mode
+    s := s + ";" + syminfo.ticker
+    s
+
+// Zahozený signál ve stejném formátu jako uzavírací alert - prázdná pole tam,
+// kde hodnota neexistuje. Sloupce v deníku tím zůstanou zarovnané.
+f_skip_alert(int dir, float score, string cls, string res, float fill, float sigc, float tp1rf, string mode) =>
+    float slip = na
+    if not na(fill) and not na(sigc)
+        slip := dir > 0 ? fill - sigc : sigc - fill
+    string s = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+    s := s + ";" + (dir > 0 ? "LONG" : "SHORT")
+    s := s + ";" + f_num(score, "#.##")
+    s := s + ";" + cls
+    s := s + ";" + res
+    s := s + ";"
+    s := s + ";"
+    s := s + ";"
+    s := s + ";"
+    s := s + ";" + (na(fill) ? "" : f_fmt(fill))
+    s := s + ";" + (na(slip) ? "" : f_num(slip, "#.####"))
+    s := s + ";"
+    s := s + ";" + (na(tp1rf) ? "" : f_num(tp1rf, "#.##"))
+    s := s + ";" + mode
+    s := s + ";" + syminfo.ticker
+    s
+
+bool   sig_long_plot  = false
+bool   sig_short_plot = false
+string a_entry = ""
+string a_exitL = ""
+string a_exitS = ""
+string a_skip  = ""
+string a_fskip = ""
+
+if conf
+    // ── 1) plnění pendingu na OPEN tohoto baru (9.1) ─────────────────────
+    if pend.has
+        float fill = open
+        // gap za stop: obchod v realitě nikdy nevznikl, do statistiky nepatří
+        bool gap = pend.dir > 0 ? fill <= pend.sl : fill >= pend.sl
+        float rf = pend.dir > 0 ? fill - pend.sl : pend.sl - fill
+        float t1 = na
+        float t2 = na
+        if rf > 0
+            t1 := (pend.dir > 0 ? pend.tp1 - fill : fill - pend.tp1) / rf
+            t2 := (pend.dir > 0 ? pend.tp2 - fill : fill - pend.tp2) / rf
+        bool slip_bad = i_min_tp1rf > 0 and (na(t1) or t1 < i_min_tp1rf)
+        bool rejected = false
+        if gap or rf <= 0
+            a_fskip := f_skip_alert(pend.dir, pend.score, pend.cls, "skipped_gap", fill, pend.sig_close, t1, pend.mode)
+            rejected := true
+        else if slip_bad
+            a_fskip := f_skip_alert(pend.dir, pend.score, pend.cls, "skipped_slippage", fill, pend.sig_close, t1, pend.mode)
+            rejected := true
+        else
+            Trade t = Trade.new(true, pend.dir, fill, pend.sig_close, pend.sl, pend.tp1, pend.tp2, rf, t1, t2, false, 0, 0, 0.0, 0.0, pend.cls, pend.score, pend.mode)
+            if pend.dir > 0
+                trL := t
+            else
+                trS := t
+        // obchod nevznikl -> vrať levelu spálený dotyk i cooldown, ale jen
+        // když se mezitím nepřestavěly levely
+        if rejected and pend.seq == clu_seq and pend.lvl_idx >= 0 and pend.lvl_idx < levels.size()
+            Lvl PL = levels.get(pend.lvl_idx)
+            if pend.dir > 0
+                PL.touch_l := math.max(0, PL.touch_l - 1)
+                PL.last_l  := pend.prev_last
+            else
+                PL.touch_s := math.max(0, PL.touch_s - 1)
+                PL.last_s  := pend.prev_last
+        pend := Pend.new()
+
+    // ── 2) průběh běžících obchodů (9.2: při souběhu TP a SL platí SL) ───
+    for d = 0 to 1
+        Trade t = d == 0 ? trL : trS
+        if t.active
+            t.bars := t.bars + 1
+            float fav = t.dir > 0 ? high - t.entry : t.entry - low
+            float adv = t.dir > 0 ? t.entry - low : high - t.entry
+            if t.r > 0
+                t.mfe := math.max(t.mfe, fav / t.r)
+                t.mae := math.max(t.mae, adv / t.r)
+            bool hit_sl  = t.dir > 0 ? low <= t.sl_cur : high >= t.sl_cur
+            bool hit_tp1 = t.dir > 0 ? high >= t.tp1 : low <= t.tp1
+            bool hit_tp2 = t.dir > 0 ? high >= t.tp2 : low <= t.tp2
+            string res = ""
+            if hit_sl
+                res := t.tp1_hit ? "TP1_BE" : "SL"
+            else
+                if hit_tp1 and not t.tp1_hit
+                    t.tp1_hit  := true
+                    t.bars_tp1 := t.bars
+                    t.sl_cur   := t.entry          // po TP1 stop na break-even
+                    bool be_hit = t.dir > 0 ? low <= t.entry : high >= t.entry
+                    if be_hit and not hit_tp2
+                        res := "TP1_BE"
+                if res == "" and hit_tp2
+                    res := "TP2"
+                if res == "" and t.bars >= i_max_hold
+                    res := t.tp1_hit ? "TP1_open" : "timeout"
+            if res != ""
+                if d == 0
+                    a_exitL := f_close_alert(t, res)
+                else
+                    a_exitS := f_close_alert(t, res)
+                t.active := false
+
+    // ── 3) nové signály na close tohoto baru ─────────────────────────────
+    bool okL = candL.ok
+    bool okS = candS.ok
+    if okL and okS
+        // protichůdné setupy na jednom baru se ruší navzájem
+        okL := false
+        okS := false
+
+    if okL or okS
+        Cand cd = okL ? candL : candS
+        int  dr = okL ? 1 : -1
+        Lvl  L  = levels.get(cd.li)
+
+        // 7.3 souběh obchodů
+        bool same_active = dr > 0 ? trL.active : trS.active
+        bool same_busy   = same_active or (pend.has and pend.dir == dr)
+        bool opp_active  = dr > 0 ? trS.active : trL.active
+
+        if same_busy
+            // zahozený signál nesmí spálit dotyk levelu ani nahodit cooldown
+            // skutečných signálů - jinak o setup přijdeš dvakrát. Vlastní
+            // cooldown má ale i sám alert, jinak by při konsolidaci na levelu
+            // odcházel na každém baru.
+            int lastsk = dr > 0 ? L.last_skip_l : L.last_skip_s
+            if (bar_index - lastsk) >= i_cooldown
+                a_skip := f_skip_alert(dr, cd.score, cd.cls, "skipped_concurrent", na, na, na, cd.mode)
+                if dr > 0
+                    L.last_skip_l := bar_index
+                else
+                    L.last_skip_s := bar_index
+            else
+                L.skip_sup := L.skip_sup + 1
+        else
+            if opp_active
+                // protisměrný signál uzavře běžící obchod na aktuální ceně
+                if dr > 0
+                    a_exitS := f_close_alert(trS, "reversed")
+                    trS.active := false
+                else
+                    a_exitL := f_close_alert(trL, "reversed")
+                    trL.active := false
+            int prev_last = dr > 0 ? L.last_l : L.last_s
+            pend := Pend.new(true, dr, cd.entry, cd.sl, cd.tp1, cd.tp2, cd.r, cd.cls, cd.score, cd.li, prev_last, clu_seq, cd.mode)
+
+            // 4.3 + 7.3.3 čítač a cooldown visí na levelu a směru, nezávisle
+            // na tom, jestli běží obchod - ale až tady, kde signál skutečně
+            // vede k pendingu
+            if dr > 0
+                L.touch_l := L.touch_l + 1
+                L.last_l  := bar_index
+            else
+                L.touch_s := L.touch_s + 1
+                L.last_s  := bar_index
+
+            // vstupní alert na close signálního baru; {vstup_next_open} tady
+            // ještě neexistuje a plní se prázdný - reálná plnicí cena
+            // a slippage jdou do uzavíracího alertu
+            float r_atr = na
+            if atr > 0
+                r_atr := cd.r / atr
+            string e = syminfo.ticker
+            e := e + ";" + timeframe.period
+            e := e + ";" + str.format_time(time, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+            e := e + ";" + (dr > 0 ? "LONG" : "SHORT")
+            e := e + ";" + cd.cls
+            e := e + ";" + cd.sessname
+            e := e + ";" + cd.lvlname
+            e := e + ";" + cd.members
+            e := e + ";" + f_num(cd.score, "#.##")
+            e := e + ";" + str.tostring(cd.order)
+            e := e + ";" + f_fmt(cd.entry)
+            e := e + ";"
+            e := e + ";" + f_fmt(cd.sl)
+            e := e + ";" + f_fmt(cd.tp1)
+            e := e + ";" + f_fmt(cd.tp2)
+            e := e + ";" + (cd.shifted ? "ano" : "ne")
+            e := e + ";" + cd.conf
+            e := e + ";" + f_num(cd.r, "#.####")
+            e := e + ";" + f_num(r_atr, "#.##")
+            e := e + ";" + f_num(cd.tp1r, "#.##")
+            e := e + ";" + f_num(cd.va_atr, "#.##")
+            e := e + ";" + cd.pattern
+            e := e + ";" + cd.mode
+            e := e + ";" + syminfo.ticker
+            a_entry := e
+
+            if dr > 0
+                sig_long_plot := true
+            else
+                sig_short_plot := true
+
+            string txt = (dr > 0 ? "LONG " : "SHORT ") + cd.members + "  sc " + f_num(cd.score, "#.##")
+            txt := txt + "  (" + cd.cls + "/" + cd.pattern + ")"
+            txt := txt + "\nE " + f_fmt(cd.entry) + "   SL " + f_fmt(cd.sl)
+            txt := txt + "\nTP1 " + f_fmt(cd.tp1) + (cd.shifted ? " ↓" : "") + " (" + f_num(i_tp1_pct, "#") + " %)"
+            txt := txt + "\nTP2 " + f_fmt(cd.tp2)
+            txt := txt + "\nTP1 = " + f_num(cd.tp1r, "#.##") + " R   conf " + cd.conf
+            label.new(bar_index, dr > 0 ? low : high, txt, style = dr > 0 ? label.style_label_up : label.style_label_down, color = color.new(dr > 0 ? color.teal : color.red, 20), textcolor = color.white, size = size.small)
+
+// alert() uvnitř podmínky, jeden řádek na událost
+if a_entry != ""
+    alert(a_entry, alert.freq_once_per_bar_close)
+if a_exitL != ""
+    alert(a_exitL, alert.freq_once_per_bar_close)
+if a_exitS != ""
+    alert(a_exitS, alert.freq_once_per_bar_close)
+if a_skip != ""
+    alert(a_skip, alert.freq_once_per_bar_close)
+if a_fskip != ""
+    alert(a_fskip, alert.freq_once_per_bar_close)
+
+// ────────────────────────────────────────────────────────────────────────────
+//  VIZUÁL
+// ────────────────────────────────────────────────────────────────────────────
+float v0h = na
+float v0p = na
+float v0l = na
+float v1h = na
+float v1p = na
+float v1l = na
+color c0 = color.gray
+color c1 = color.gray
+if ready
+    c0 := f_scol(sess0.sid)
+    c1 := f_scol(sess1.sid)
+    if i_show_lvls
+        v0h := sess0.vah
+        v0p := sess0.poc
+        v0l := sess0.val
+        v1h := sess1.vah
+        v1p := sess1.poc
+        v1l := sess1.val
+
+p0h = plot(v0h, "Starší VAH", color = c0, style = plot.style_linebr, linewidth = 1)
+p0p = plot(v0p, "Starší POC", color = c0, style = plot.style_linebr, linewidth = 3)
+p0l = plot(v0l, "Starší VAL", color = c0, style = plot.style_linebr, linewidth = 1)
+p1h = plot(v1h, "Novější VAH", color = c1, style = plot.style_linebr, linewidth = 1)
+p1p = plot(v1p, "Novější POC", color = c1, style = plot.style_linebr, linewidth = 3)
+p1l = plot(v1l, "Novější VAL", color = c1, style = plot.style_linebr, linewidth = 1)
+
+fill(p0h, p0l, color = i_show_va ? color.new(c0, 94) : na, title = "Starší VA")
+fill(p1h, p1l, color = i_show_va ? color.new(c1, 94) : na, title = "Novější VA")
+
+plotshape(sig_long_plot, "Signál LONG", shape.triangleup, location.belowbar, color.new(color.teal, 0), size = size.small)
+plotshape(sig_short_plot, "Signál SHORT", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.small)
+
+// ── tabulka ─────────────────────────────────────────────────────────────────
+var table tb = table.new(position.top_right, 6, 13, border_width = 1, frame_color = color.new(color.gray, 50), frame_width = 1)
+
+f_cell(int col, int row, string txt, color bg, color tx) =>
+    table.cell(tb, col, row, txt, text_color = tx, bgcolor = bg, text_size = size.small, text_halign = text.align_left)
+
+if i_show_tbl and barstate.islast
+    table.clear(tb, 0, 0, 5, 12)
+    color hdr = color.new(color.gray, 75)
+    color bg  = color.new(color.black, 85)
+    color tc  = color.white
+
+    string warn = ""
+    if not tf_ok
+        warn := "⚠ TF > 15m — indikátor je pro 1m–15m"
+    else if not ready
+        warn := "⏳ čekám na data"
+    if i_prof_src == "tick_proxy" and not ltf_ok
+        warn := warn + (warn == "" ? "" : " · ") + "⚠ LTF není nižší než TF grafu, jedu na autodetekci"
+    else if proxy_on
+        warn := warn + (warn == "" ? "" : " · ") + "⚠ tick_proxy: krátká historie"
+
+    // režim profilu novější dokončené session; dokud žádná není, jen záměr
+    string md_now = i_prof_src
+    if not na(sess1)
+        md_now := sess1.mode
+    else if i_prof_src == "auto"
+        md_now := feed_tick ? "tick?" : "vol?"
+
+    f_cell(0, 0, "SVA-RR v3.2a", hdr, tc)
+    f_cell(1, 0, "ATR " + f_fmt(atr), hdr, tc)
+    f_cell(2, 0, "profil: " + md_now, hdr, md_now == "tpo" or md_now == "tick_proxy" ? color.yellow : tc)
+    f_cell(3, 0, syminfo.ticker, hdr, tc)
+    f_cell(4, 0, warn, hdr, warn == "" ? tc : color.yellow)
+
+    f_cell(0, 1, "Session", hdr, tc)
+    f_cell(1, 1, "VAH", hdr, tc)
+    f_cell(2, 1, "POC", hdr, tc)
+    f_cell(3, 1, "VAL", hdr, tc)
+    f_cell(4, 1, "VA×ATR", hdr, tc)
+    f_cell(5, 1, "", hdr, tc)
+
+    for s = 0 to 1
+        Sess S = s == 0 ? sess0 : sess1
+        int r = 2 + s
+        if na(S)
+            f_cell(0, r, "—", bg, tc)
+        else
+            f_cell(0, r, S.name + (s == 1 ? " (nov.)" : ""), bg, f_scol(S.sid))
+            f_cell(1, r, f_fmt(S.vah), bg, tc)
+            f_cell(2, r, f_fmt(S.poc), bg, tc)
+            f_cell(3, r, f_fmt(S.val), bg, tc)
+            f_cell(4, r, S.atr_done > 0 ? f_num((S.vah - S.val) / S.atr_done, "#.##") : "-", bg, tc)
+
+    f_cell(0, 4, "Shluk", hdr, tc)
+    f_cell(1, 4, "Skóre", hdr, tc)
+    f_cell(2, 4, "Cena", hdr, tc)
+    f_cell(3, 4, "Zóna", hdr, tc)
+    f_cell(4, 4, "Dotyky L/S", hdr, tc)
+    f_cell(5, 4, "Potl. skipy", hdr, tc)
+
+    if ready
+        int row = 5
+        for ci = 0 to math.min(clusters.size() - 1, 5)
+            Clu c = clusters.get(ci)
+            int lidx = c.val_lvl >= 0 ? c.val_lvl : c.vah_lvl
+            string tch = "-"
+            string sup = "-"
+            if lidx >= 0
+                Lvl L = levels.get(lidx)
+                tch := str.tostring(L.touch_l) + " / " + str.tostring(L.touch_s)
+                sup := str.tostring(L.skip_sup)
+            color cc = c.score >= 2.0 ? color.orange : tc
+            f_cell(0, row, c.members, bg, cc)
+            f_cell(1, row, f_num(c.score, "#.##"), bg, cc)
+            f_cell(2, row, f_fmt(c.price), bg, tc)
+            f_cell(3, row, f_fmt(c.lo) + " – " + f_fmt(c.hi), bg, tc)
+            f_cell(4, row, tch, bg, tc)
+            f_cell(5, row, sup, bg, sup == "0" or sup == "-" ? tc : color.yellow)
+            row := row + 1
+
+    string trs = "nic"
+    if trL.active and trS.active
+        trs := "long + short"
+    else if trL.active
+        trs := "běží LONG (" + str.tostring(trL.bars) + " b)"
+    else if trS.active
+        trs := "běží SHORT (" + str.tostring(trS.bars) + " b)"
+    else if pend.has
+        trs := "čeká na plnění"
+
+    f_cell(0, 11, "Tracker", hdr, tc)
+    f_cell(1, 11, trs, bg, tc)
+    f_cell(2, 11, "Tol. shluku (fix)", hdr, tc)
+    f_cell(3, 11, na(clu_tol_used) ? "-" : f_fmt(clu_tol_used), bg, tc)
+    f_cell(4, 11, "shluků: " + str.tostring(clusters.size()), bg, tc)
