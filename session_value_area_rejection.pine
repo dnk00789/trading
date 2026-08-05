@@ -1,6 +1,7 @@
 //@version=6
 // ============================================================================
-//  Session Value Area — Rejection & Reversion   (zadání v3.1)
+//  Session Value Area — Rejection & Reversion
+//  zadání v3.1 + patche v3.1a, v3.1b, v3.2a
 // ----------------------------------------------------------------------------
 //  Princip: cena odmítne hranu value area DOKONČENÉ session a uzavře zpátky
 //  dovnitř -> vstup směrem do value area. TP1 = POC té samé session,
@@ -31,7 +32,7 @@
 //  POŘADÍ POLÍ V ALERTECH - nová pole se přidávají VÝHRADNĚ NA KONEC, jinak
 //  se znehodnotí všechno, co je do té chvíle zalogované.
 //
-//  VSTUPNÍ ALERT (22 polí):
+//  VSTUPNÍ ALERT (24 polí):
 //   1 ticker · 2 tf · 3 cas_utc · 4 SMER · 5 trida · 6 session · 7 level
 //   8 cluster_members · 9 cluster_score · 10 poradi_dotyku · 11 vstup_close
 //   12 vstup_next_open (vždy prázdné) · 13 SL · 14 TP1 · 15 TP2
@@ -635,7 +636,7 @@ Cand candS = f_eval(-1)
 //  TRACKER + ALERTY
 // ────────────────────────────────────────────────────────────────────────────
 
-// Druhý alert po uzavření obchodu (9.3), 13 polí - pořadí viz hlavička.
+// Druhý alert po uzavření obchodu (9.3), 15 polí - pořadí viz hlavička.
 // realized_R respektuje dělenou pozici: TP1 vybere i_tp1_pct procent, zbytek
 // dojede na TP2, break-even stop, timeout nebo obrat.
 f_close_alert(Trade t, string res) =>
