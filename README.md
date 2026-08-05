@@ -44,12 +44,21 @@ a nevydá signál.
 2. **`poradi_dotyku` = pořadí signálu** na daném levelu a směru od dokončení
    session, ne pořadí každého fyzického dotyku zóny. Na 1m grafu by druhá
    varianta vyčerpala limit 2 dřív, než vůbec vznikne setup.
-3. **`tolerance`** ze sekcí 5.1/5.2 zadání nečísluje — je z ní input `i_tol`
-   (default **0.10 × ATR**), aby zůstalo pravidlo „všechno v ATR".
-4. **Výsledky `BE` vs `TP1_only`**: `BE` = TP1 zasažen a zbytek vyhozen na
-   break-even stopu; `TP1_only` = TP1 zasažen a obchod skončil timeoutem.
+3. **`tolerance`** ze sekcí 5.1/5.2 je input `i_tol`, default **0.25 × ATR**.
+4. **`realized_R` respektuje dělenou pozici.** Obchod, který vybral TP1 a pak
+   se vrátil na break-even, je `TP1_BE` s kladným `realized_R`
+   (`i_tp1_pct/100 × tp1_v_R_fill`), ne nula. Ostatní: `TP2` dopočítá i zbytek
+   pozice, `TP1_open` a `reversed` po TP1 berou zbytek za aktuální cenu,
+   `SL` je vždy `−1.0`.
 5. **Long i short signál na stejném baru** se ruší navzájem — protichůdný
    setup na jednom baru je artefakt, ne obchod.
+6. **Poměry se po plnění přepočítávají z reálné plnicí ceny** (`R_fill`,
+   `tp1_v_R_fill`), protože po gapu se plán a realita liší. Vstupní filtr
+   `min_tp1_r` se pořád vyhodnocuje na close signálu — tam se rozhoduje —
+   ale volitelný `min_tp1r_fill` (default 0 = vypnuto) umí obchod odmítnout,
+   když ho plnění posune pod práh; zaloguje se jako `skipped_slippage`.
+7. **Gap za stop obchod neotevře.** Když open plnicího baru leží už za SL,
+   obchod v realitě nikdy nevznikl — místo něj jde do deníku `skipped_gap`.
 6. **`skipped_concurrent`** se loguje ve formátu výsledkového alertu
    (`{cas};{SMER};{score};{trida};skipped_concurrent;;;;`), obchod se netrackuje.
 7. Profil přiřazuje **celý objem baru do jednoho binu podle `hlc3`** přesně
@@ -68,15 +77,19 @@ Vstup (sekce 9):
 `{vstup_next_open}` je ve vstupním alertu prázdné — na close signálního baru
 ještě neexistuje.
 
-Uzavření (sekce 9.3), poslední dvě pole jsou nad rámec zadání a nesou
-slippage z bodu 1 výše:
+Uzavření (sekce 9.3), poslední čtyři pole jsou nad rámec zadání — nesou
+slippage z bodu 1 a realizované R z bodu 4:
 
 ```
-{cas};{SMER};{cluster_score};{trida};{vysledek};{MFE_v_R};{MAE_v_R};{bary_do_TP1};{dosel_na_TP2};{vstup_next_open};{slippage_body}
+{cas};{SMER};{cluster_score};{trida};{vysledek};{MFE_v_R};{MAE_v_R};{bary_do_TP1};{dosel_na_TP2};{vstup_next_open};{slippage_body};{realized_R};{tp1_v_R_fill}
 ```
 
-`vysledek` ∈ `TP1_only` / `TP2` / `SL` / `BE` / `reversed` / `timeout` /
-`skipped_concurrent`.
+`vysledek` ∈ `SL` / `TP1_BE` / `TP2` / `TP1_open` / `timeout` / `reversed` /
+`skipped_concurrent` / `skipped_gap` / `skipped_slippage`.
+
+Všechny `skipped_*` řádky jdou ve **stejném formátu** jako uzavírací alert,
+s prázdnými poli tam, kde hodnota neexistuje — sloupce v deníku tím zůstanou
+zarovnané. Nová pole se proto přidávají výhradně na konec.
 
 Alert v TradingView nastav na **Any alert() function call** s frekvencí
 *Once per bar close*.

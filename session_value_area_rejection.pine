@@ -17,13 +17,39 @@
 //  Poznámka k alertům (9.1): vstupní alert odchází na CLOSE SIGNÁLNÍHO BARU,
 //  tedy v okamžiku, kdy se rozhoduje. Open následujícího baru v tu chvíli
 //  principiálně neexistuje, takže pole {vstup_next_open} zůstává prázdné
-//  a reálná plnicí cena i slippage se logují až v uzavíracím alertu (dvě
-//  pole navíc na jeho konci). Plnění a všechny výpočty výsledku pořád běží
-//  z open následujícího baru, jak zadání chce.
+//  a reálná plnicí cena i slippage se logují až v uzavíracím alertu.
+//  Plnění a všechny výpočty výsledku běží z open následujícího baru.
 //
 //  Pořadí dotyku (5.5) se počítá jako pořadí SIGNÁLU na daném levelu a směru
 //  od dokončení session, ne jako pořadí každého fyzického dotyku zóny - na
 //  1m grafu by druhá varianta vyčerpala limit dřív, než vůbec vznikne setup.
+//
+//  Protichůdné signály na jednom baru se navzájem ruší. V zadání to není,
+//  ale long a short současně na stejném baru je artefakt, ne obchod.
+//
+// ----------------------------------------------------------------------------
+//  POŘADÍ POLÍ V ALERTECH - nová pole se přidávají VÝHRADNĚ NA KONEC, jinak
+//  se znehodnotí všechno, co je do té chvíle zalogované.
+//
+//  VSTUPNÍ ALERT (22 polí):
+//   1 ticker · 2 tf · 3 cas_utc · 4 SMER · 5 trida · 6 session · 7 level
+//   8 cluster_members · 9 cluster_score · 10 poradi_dotyku · 11 vstup_close
+//   12 vstup_next_open (vždy prázdné) · 13 SL · 14 TP1 · 15 TP2
+//   16 tp1_posunuty · 17 tp1_confidence · 18 R_body · 19 R_atr · 20 tp1_v_R
+//   21 sirka_VA_atr · 22 pattern
+//
+//  UZAVÍRACÍ ALERT (13 polí) - stejný formát mají i všechny skipped_* řádky,
+//  s prázdnými poli tam, kde hodnota neexistuje:
+//   1 cas · 2 SMER · 3 cluster_score · 4 trida · 5 vysledek · 6 MFE_v_R
+//   7 MAE_v_R · 8 bary_do_TP1 · 9 dosel_na_TP2 · 10 vstup_next_open
+//   11 slippage_body · 12 realized_R · 13 tp1_v_R_fill
+//
+//  vysledek: SL · TP1_BE · TP2 · TP1_open · timeout · reversed ·
+//            skipped_concurrent · skipped_gap · skipped_slippage
+//
+//  realized_R respektuje dělenou pozici (i_tp1_pct): obchod, který vybral
+//  TP1 a pak se vrátil na break-even, je TP1_BE s kladným realized_R, ne
+//  nula. Bez toho deník podhodnocuje výkon v nejčastějším scénáři.
 // ============================================================================
 
 indicator("Session Value Area — Rejection & Reversion v3.1", "SVA-RR", overlay = true, max_boxes_count = 100, max_labels_count = 500, max_lines_count = 100, max_bars_back = 500)
@@ -53,7 +79,7 @@ i_w_edge  = input.float(1.0,  "Váha VAH / VAL",           minval = 0, step = 0.
 i_clu_tol = input.float(0.20, "Tolerance shluku (× ATR)", minval = 0, step = 0.01, group = G_CLU)
 
 var string G_ENTRY = "5 · Vstup"
-i_tol       = input.float(0.10, "Tolerance dotyku/průrazu (× ATR)",  minval = 0,    step = 0.01, group = G_ENTRY)
+i_tol       = input.float(0.25, "Tolerance dotyku/průrazu (× ATR)",  minval = 0,    step = 0.01, group = G_ENTRY)
 i_look      = input.int(5,      "Origin lookback (barů)",            minval = 2,                 group = G_ENTRY)
 i_min_in    = input.int(3,      "Origin — min barů uvnitř VA",       minval = 1,                 group = G_ENTRY)
 i_reclaim   = input.bool(false, "Povolit reclaim (třída B)",                                     group = G_ENTRY)
@@ -62,7 +88,8 @@ i_win       = input.int(3,      "Pattern B — okno barů",             minval =
 i_min_touch = input.int(2,      "Pattern B — min dotyků",            minval = 1,                 group = G_ENTRY)
 i_min_score = input.float(1.0,  "Min skóre shluku",                  minval = 0,    step = 0.5,  group = G_ENTRY)
 i_min_pocd  = input.float(0.8,  "Min vzdálenost k POC (× ATR)",      minval = 0,    step = 0.1,  group = G_ENTRY)
-i_min_tp1r  = input.float(1.0,  "Min TP1 v R",                       minval = 0,    step = 0.1,  group = G_ENTRY)
+i_min_tp1r  = input.float(1.0,  "Min TP1 v R (na close signálu)",    minval = 0,    step = 0.1,  group = G_ENTRY)
+i_min_tp1rf = input.float(0.0,  "Min TP1 v R po plnění (0 = vyp.)",  minval = 0,    step = 0.1,  group = G_ENTRY)
 i_max_touch = input.int(2,      "Max pořadí dotyku levelu",          minval = 1,                 group = G_ENTRY)
 
 var string G_RISK = "6 · Stop-loss"
@@ -166,22 +193,26 @@ type Pend
     string cls       = ""
     float  score     = 0.0
 
+// r, tp1r_fill i tp2r_fill jsou přepočítané z REÁLNÉ plnicí ceny, ne z close
+// signálního baru - po gapu se plán a realita můžou lišit o desetiny R.
 type Trade
     bool   active    = false
     int    dir       = 0
     float  entry     = na
     float  sig_close = na
-    float  sl_cur   = na
-    float  tp1      = na
-    float  tp2      = na
-    float  r        = na
-    bool   tp1_hit  = false
-    int    bars     = 0
-    int    bars_tp1 = 0
-    float  mfe      = 0.0
-    float  mae      = 0.0
-    string cls      = ""
-    float  score    = 0.0
+    float  sl_cur    = na
+    float  tp1       = na
+    float  tp2       = na
+    float  r         = na
+    float  tp1r_fill = na
+    float  tp2r_fill = na
+    bool   tp1_hit   = false
+    int    bars      = 0
+    int    bars_tp1  = 0
+    float  mfe       = 0.0
+    float  mae       = 0.0
+    string cls       = ""
+    float  score     = 0.0
 
 // ────────────────────────────────────────────────────────────────────────────
 //  POMOCNÉ FUNKCE
@@ -430,11 +461,13 @@ f_eval(int dir) =>
                 // 5.1a stavová podmínka
                 bool state = dir > 0 ? close > lref : close < lref
                 if state
-                    // 5.1b podmínka původu
+                    // 5.1b podmínka původu - čte VÝHRADNĚ bary před signálním,
+                    // signální bar je stavovou podmínkou vždy na správné
+                    // straně a počítal by se do "uvnitř VA" zadarmo
                     int inside = 0
                     int breach = 0
                     for i = 0 to i_look - 1
-                        float cl = close[i]
+                        float cl = close[i + 1]
                         if cl >= S.val and cl <= S.vah
                             inside := inside + 1
                         if (dir > 0 and cl < S.val - tol) or (dir < 0 and cl > S.vah + tol)
@@ -520,12 +553,29 @@ Cand candS = f_eval(-1)
 //  TRACKER + ALERTY
 // ────────────────────────────────────────────────────────────────────────────
 
-// druhý alert po uzavření obchodu (9.3)
-// Poslední dvě pole jsou nad rámec zadání: vstupní alert odchází na close
-// signálního baru, kde open dalšího baru ještě neexistuje, takže reálná
-// plnicí cena a slippage se logují až tady. Bez nich by 9.1 nešlo změřit.
+// Druhý alert po uzavření obchodu (9.3), 13 polí - pořadí viz hlavička.
+// realized_R respektuje dělenou pozici: TP1 vybere i_tp1_pct procent, zbytek
+// dojede na TP2, break-even stop, timeout nebo obrat.
 f_close_alert(Trade t, string res) =>
     float slip = t.dir > 0 ? t.entry - t.sig_close : t.sig_close - t.entry
+    float p    = i_tp1_pct / 100.0
+    float openr = na
+    if t.r > 0
+        openr := (t.dir > 0 ? close - t.entry : t.entry - close) / t.r
+    float realized = na
+    if res == "SL"
+        realized := -1.0
+    else if res == "TP1_BE"
+        realized := p * t.tp1r_fill
+    else if res == "TP2"
+        realized := p * t.tp1r_fill + (1.0 - p) * t.tp2r_fill
+    else if res == "TP1_open"
+        realized := p * t.tp1r_fill + (1.0 - p) * openr
+    else if t.tp1_hit
+        // reversed po zásahu TP1: zbytek ven za aktuální cenu
+        realized := p * t.tp1r_fill + (1.0 - p) * openr
+    else
+        realized := openr
     string s = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
     s := s + ";" + (t.dir > 0 ? "LONG" : "SHORT")
     s := s + ";" + f_num(t.score, "#.##")
@@ -537,6 +587,29 @@ f_close_alert(Trade t, string res) =>
     s := s + ";" + (res == "TP2" ? "ano" : "ne")
     s := s + ";" + f_fmt(t.entry)
     s := s + ";" + f_num(slip, "#.####")
+    s := s + ";" + f_num(realized, "#.###")
+    s := s + ";" + f_num(t.tp1r_fill, "#.##")
+    s
+
+// Zahozený signál ve stejném formátu jako uzavírací alert - prázdná pole tam,
+// kde hodnota neexistuje. Sloupce v deníku tím zůstanou zarovnané.
+f_skip_alert(int dir, float score, string cls, string res, float fill, float sigc, float tp1rf) =>
+    float slip = na
+    if not na(fill) and not na(sigc)
+        slip := dir > 0 ? fill - sigc : sigc - fill
+    string s = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+    s := s + ";" + (dir > 0 ? "LONG" : "SHORT")
+    s := s + ";" + f_num(score, "#.##")
+    s := s + ";" + cls
+    s := s + ";" + res
+    s := s + ";"
+    s := s + ";"
+    s := s + ";"
+    s := s + ";"
+    s := s + ";" + (na(fill) ? "" : f_fmt(fill))
+    s := s + ";" + (na(slip) ? "" : f_num(slip, "#.####"))
+    s := s + ";"
+    s := s + ";" + (na(tp1rf) ? "" : f_num(tp1rf, "#.##"))
     s
 
 bool   sig_long_plot  = false
@@ -545,19 +618,31 @@ string a_entry = ""
 string a_exitL = ""
 string a_exitS = ""
 string a_skip  = ""
+string a_fskip = ""
 
 if conf
     // ── 1) plnění pendingu na OPEN tohoto baru (9.1) ─────────────────────
     if pend.has
         float fill = open
-        float R = pend.dir > 0 ? fill - pend.sl : pend.sl - fill
-        if R <= 0
-            R := pend.r                      // gap přes SL: ať deník nespadne
-        Trade t = Trade.new(true, pend.dir, fill, pend.sig_close, pend.sl, pend.tp1, pend.tp2, R, false, 0, 0, 0.0, 0.0, pend.cls, pend.score)
-        if pend.dir > 0
-            trL := t
+        // gap za stop: obchod v realitě nikdy nevznikl, do statistiky nepatří
+        bool gap = pend.dir > 0 ? fill <= pend.sl : fill >= pend.sl
+        float rf = pend.dir > 0 ? fill - pend.sl : pend.sl - fill
+        float t1 = na
+        float t2 = na
+        if rf > 0
+            t1 := (pend.dir > 0 ? pend.tp1 - fill : fill - pend.tp1) / rf
+            t2 := (pend.dir > 0 ? pend.tp2 - fill : fill - pend.tp2) / rf
+        bool slip_bad = i_min_tp1rf > 0 and (na(t1) or t1 < i_min_tp1rf)
+        if gap or rf <= 0
+            a_fskip := f_skip_alert(pend.dir, pend.score, pend.cls, "skipped_gap", fill, pend.sig_close, t1)
+        else if slip_bad
+            a_fskip := f_skip_alert(pend.dir, pend.score, pend.cls, "skipped_slippage", fill, pend.sig_close, t1)
         else
-            trS := t
+            Trade t = Trade.new(true, pend.dir, fill, pend.sig_close, pend.sl, pend.tp1, pend.tp2, rf, t1, t2, false, 0, 0, 0.0, 0.0, pend.cls, pend.score)
+            if pend.dir > 0
+                trL := t
+            else
+                trS := t
         pend := Pend.new()
 
     // ── 2) průběh běžících obchodů (9.2: při souběhu TP a SL platí SL) ───
@@ -575,7 +660,7 @@ if conf
             bool hit_tp2 = t.dir > 0 ? high >= t.tp2 : low <= t.tp2
             string res = ""
             if hit_sl
-                res := t.tp1_hit ? "BE" : "SL"
+                res := t.tp1_hit ? "TP1_BE" : "SL"
             else
                 if hit_tp1 and not t.tp1_hit
                     t.tp1_hit  := true
@@ -583,11 +668,11 @@ if conf
                     t.sl_cur   := t.entry          // po TP1 stop na break-even
                     bool be_hit = t.dir > 0 ? low <= t.entry : high >= t.entry
                     if be_hit and not hit_tp2
-                        res := "BE"
+                        res := "TP1_BE"
                 if res == "" and hit_tp2
                     res := "TP2"
                 if res == "" and t.bars >= i_max_hold
-                    res := t.tp1_hit ? "TP1_only" : "timeout"
+                    res := t.tp1_hit ? "TP1_open" : "timeout"
             if res != ""
                 if d == 0
                     a_exitL := f_close_alert(t, res)
@@ -607,14 +692,6 @@ if conf
         Cand cd = okL ? candL : candS
         int  dr = okL ? 1 : -1
         Lvl  L  = levels.get(cd.li)
-        // 4.3 + 7.3.3 čítač a cooldown visí na levelu a směru, nezávisle
-        // na tom, jestli zrovna běží obchod
-        if dr > 0
-            L.touch_l := L.touch_l + 1
-            L.last_l  := bar_index
-        else
-            L.touch_s := L.touch_s + 1
-            L.last_s  := bar_index
 
         // 7.3 souběh obchodů
         bool same_active = dr > 0 ? trL.active : trS.active
@@ -622,12 +699,9 @@ if conf
         bool opp_active  = dr > 0 ? trS.active : trL.active
 
         if same_busy
-            string k = str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
-            k := k + ";" + (dr > 0 ? "LONG" : "SHORT")
-            k := k + ";" + f_num(cd.score, "#.##")
-            k := k + ";" + cd.cls
-            k := k + ";skipped_concurrent;;;;"
-            a_skip := k
+            // zahozený signál nesmí spálit dotyk levelu ani nahodit cooldown -
+            // jinak o setup přijdeš dvakrát
+            a_skip := f_skip_alert(dr, cd.score, cd.cls, "skipped_concurrent", na, na, na)
         else
             if opp_active
                 // protisměrný signál uzavře běžící obchod na aktuální ceně
@@ -638,6 +712,16 @@ if conf
                     a_exitL := f_close_alert(trL, "reversed")
                     trL.active := false
             pend := Pend.new(true, dr, cd.entry, cd.sl, cd.tp1, cd.tp2, cd.r, cd.cls, cd.score)
+
+            // 4.3 + 7.3.3 čítač a cooldown visí na levelu a směru, nezávisle
+            // na tom, jestli běží obchod - ale až tady, kde signál skutečně
+            // vede k pendingu
+            if dr > 0
+                L.touch_l := L.touch_l + 1
+                L.last_l  := bar_index
+            else
+                L.touch_s := L.touch_s + 1
+                L.last_s  := bar_index
 
             // vstupní alert na close signálního baru; {vstup_next_open} tady
             // ještě neexistuje a plní se prázdný - reálná plnicí cena
@@ -691,6 +775,8 @@ if a_exitS != ""
     alert(a_exitS, alert.freq_once_per_bar_close)
 if a_skip != ""
     alert(a_skip, alert.freq_once_per_bar_close)
+if a_fskip != ""
+    alert(a_fskip, alert.freq_once_per_bar_close)
 
 // ────────────────────────────────────────────────────────────────────────────
 //  VIZUÁL
